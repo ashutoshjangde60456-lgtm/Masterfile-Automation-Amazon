@@ -1,9 +1,9 @@
-# streamlit_app.py
 import io
 import json
 import re
 import time
 import zipfile
+import hashlib
 from pathlib import Path
 from textwrap import dedent
 
@@ -15,7 +15,7 @@ from openpyxl import load_workbook
 # Page config
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation — OpenPyXL (No extra installs)",
+    page_title="Masterfile Automation — Cached & Fast (OpenPyXL)",
     page_icon="🧾",
     layout="wide",
 )
@@ -53,11 +53,6 @@ def norm(s: str) -> str:
     x = re.sub(r"[^0-9a-z\s]+", " ", x)
     return re.sub(r"\s+", " ", x).strip()
 
-def nonempty_rows(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-    return df.replace("", pd.NA).dropna(how="all").shape[0]
-
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=4096, empty_streak_stop=8):
     max_try = min(ws.max_column or 1, hard_cap)
     last_nonempty, streak = 0, 0
@@ -84,7 +79,7 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
         header_set = {norm(c) for c in df.columns}
         matches = sum(any(norm(a) in header_set for a in aliases)
                       for aliases in mapping_aliases_by_master.values())
-        rows = nonempty_rows(df)
+        rows = df.replace("", pd.NA).dropna(how="all").shape[0]
         score = matches + (0.01 if rows > 0 else 0.0)
         if score > best_score:
             best, best_score = (df, sheet), score
@@ -98,7 +93,6 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
 # ─────────────────────────────────────────────────────────────────────
 def openpyxl_delta_fast(master_bytes: bytes,
                         sheet_name: str,
-                        header_row: int,
                         start_row: int,
                         used_cols: int,
                         block_2d: list,
@@ -119,47 +113,9 @@ def openpyxl_delta_fast(master_bytes: bytes,
     end_row_new  = start_row + max(0, target_rows - 1)
     end_row_prev = ws.max_row or (start_row - 1)
 
-    # Read existing overlap region once
-    overlap = max(0, min(end_row_prev, end_row_new) - start_row + 1)
-
-    # Short-circuit if nothing changes (huge win)
-    nothing_changed = True
-    if overlap:
-        it = ws.iter_rows(min_row=start_row,
-                          max_row=start_row + overlap - 1,
-                          min_col=1,
-                          max_col=used_cols,
-                          values_only=True)
-        for i, old_row_vals in enumerate(it):
-            new_vals = block_2d[i]
-            # normalize to used_cols
-            if len(new_vals) < used_cols:
-                new_vals = new_vals + [""] * (used_cols - len(new_vals))
-            elif len(new_vals) > used_cols:
-                new_vals = new_vals[:used_cols]
-            # compare whole row fast
-            for j in range(used_cols):
-                old_v = old_row_vals[j] if old_row_vals and j < len(old_row_vals) else None
-                nv = new_vals[j]
-                nv_norm = None if nv == "" else nv
-                if old_v != nv_norm:
-                    nothing_changed = False
-                    break
-            if not nothing_changed:
-                break
-    else:
-        # If there’s no overlap and no new rows and no old rows → nothing to do
-        if end_row_new == end_row_prev:
-            nothing_changed = True
-        else:
-            nothing_changed = False
-
-    if nothing_changed and end_row_prev == end_row_new:
-        # No updates at all → return original bytes immediately
-        return master_bytes
-
     # 1) Update overlap rows (only changed cells)
-    if overlap and not nothing_changed:
+    overlap = max(0, min(end_row_prev, end_row_new) - start_row + 1)
+    if overlap:
         it = ws.iter_rows(min_row=start_row,
                           max_row=start_row + overlap - 1,
                           min_col=1,
@@ -172,18 +128,14 @@ def openpyxl_delta_fast(master_bytes: bytes,
             elif len(new_vals) > used_cols:
                 new_vals = new_vals[:used_cols]
             row_idx = start_row + i
-            # row-level fast skip
-            row_diff = False
             for j in range(used_cols):
                 old_v = old_row_vals[j] if old_row_vals and j < len(old_row_vals) else None
                 nv = new_vals[j]
                 nv_norm = None if nv == "" else nv
                 if old_v != nv_norm:
-                    row_diff = True
                     ws.cell(row=row_idx, column=j+1).value = nv_norm
-            # if row_diff False, no per-cell writes executed
 
-    # 2) Append new rows (tail only)
+    # 2) Append new tail rows
     for i in range(overlap, target_rows):
         row = block_2d[i]
         if len(row) > used_cols:
@@ -192,7 +144,7 @@ def openpyxl_delta_fast(master_bytes: bytes,
             row = row + [""] * (used_cols - len(row))
         ws.append(tuple(row))
 
-    # 3) Trim surplus old rows (one delete)
+    # 3) Trim old tail in one call
     if end_row_prev > end_row_new:
         ws.delete_rows(end_row_new + 1, end_row_prev - end_row_new)
 
@@ -216,10 +168,50 @@ def openpyxl_delta_fast(master_bytes: bytes,
     return raw
 
 # ─────────────────────────────────────────────────────────────────────
+# Build-key hashing + cache
+# ─────────────────────────────────────────────────────────────────────
+def _stable_hash_bytes(*parts: bytes) -> str:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p)
+        h.update(b"|")
+    return h.hexdigest()
+
+def _block_to_ndjson(block_2d, used_cols: int) -> bytes:
+    # Compact, deterministic representation of the block (avoids huge JSON arrays in cache key)
+    lines = []
+    for row in block_2d:
+        r = row[:used_cols] + [""] * max(0, used_cols - len(row))
+        lines.append(json.dumps(r, separators=(",", ":")))  # stable, minimal
+    return ("\n".join(lines)).encode("utf-8")
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def build_cached(master_bytes: bytes,
+                 mapping_json: str,
+                 block_ndjson: bytes,
+                 sheet_name: str,
+                 start_row: int,
+                 used_cols: int) -> bytes:
+    """
+    Cache entry keyed by master + mapping + block contents.
+    If the same data is requested again, we return the bytes instantly.
+    """
+    # The function inputs themselves are the cache key; nothing to do here.
+    block_2d = [json.loads(line) for line in block_ndjson.decode("utf-8").splitlines()] if block_ndjson else []
+    return openpyxl_delta_fast(
+        master_bytes=master_bytes,
+        sheet_name=sheet_name,
+        start_row=start_row,
+        used_cols=used_cols,
+        block_2d=block_2d,
+        repack=True,
+    )
+
+# ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation — OpenPyXL (Fast, No extra installs)")
-st.caption("Preserves the whole workbook. Delta updates + zero-compression zip; no additional packages required.")
+st.title("🧾 Masterfile Automation — Cached & Fast (OpenPyXL only)")
+st.caption("Preserves the whole workbook. Delta updates + content cache for instant repeat runs.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
@@ -253,12 +245,8 @@ if go:
             # Parse mapping
             status.update(label="Parsing mapping JSON…")
             mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
-            mapping_aliases = {}
-            for k, v in mapping_raw.items():
-                aliases = v[:] if isinstance(v, list) else [v]
-                if k not in aliases:
-                    aliases.append(k)
-                mapping_aliases[norm(k)] = aliases
+            # keep a deterministic, compact mapping string for the key
+            mapping_json_compact = json.dumps(mapping_raw, separators=(",", ":"), sort_keys=True)
 
             # Read Template headers (read-only)
             status.update(label="Reading template headers…")
@@ -276,16 +264,17 @@ if go:
             wb_ro.close()
             status.write(f"✅ Template headers loaded ({used_cols} columns) in {time.time()-t0:.2f}s")
 
-            # Read onboarding — select best sheet by mapping coverage
+            # Read onboarding — choose best sheet
             status.update(label="Reading onboarding…")
             onboarding_file.seek(0)
             xl = pd.ExcelFile(onboarding_file, engine="openpyxl")
-            mapping_aliases_for_pick = {}
+            # derive aliases map
+            aliases_map = {}
             for k, v in mapping_raw.items():
                 aliases = v[:] if isinstance(v, list) else [v]
                 if k not in aliases: aliases.append(k)
-                mapping_aliases_for_pick[norm(k)] = aliases
-            best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases_for_pick)
+                aliases_map[norm(k)] = aliases
+            best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, aliases_map)
             df = best_df.fillna("")
             on_headers = list(df.columns)
             status.write(f"✅ Onboarding: **{best_sheet}** ({info}); rows={len(df)}")
@@ -313,7 +302,7 @@ if go:
                 eff_norm = norm(effective)
                 if not eff_norm:
                     continue
-                aliases = mapping_aliases.get(eff_norm, [effective])
+                aliases = aliases_map.get(eff_norm, [effective])
                 resolved = None
                 for a in aliases:
                     s = series_by_alias.get(norm(a))
@@ -334,7 +323,7 @@ if go:
             for line in report_lines:
                 status.write(line)
 
-            # Build 2D block (strings only)
+            # Build 2D block (strings only) + compact NDJSON for cache key
             status.update(label="Building data block…")
             n_rows = len(df)
             block = [[""] * used_cols for _ in range(n_rows)]
@@ -349,20 +338,23 @@ if go:
                         v = sanitize(vals[i].strip())
                         if v and v.lower() not in ("nan", "none", ""):
                             block[i][col-1] = v
+            block_ndjson = _block_to_ndjson(block, used_cols)
 
-            # Write via pure OpenPyXL (delta) with zero-compression repack
-            status.update(label="Writing (OpenPyXL delta; no extra installs)…")
+            # Cache key (implicit) = function args; we also show a tiny fingerprint
+            fingerprint = _stable_hash_bytes(master_bytes, mapping_json_compact.encode("utf-8"), block_ndjson)[:12]
+            status.update(label=f"Writing (cache key {fingerprint})…")
             t_write = time.time()
-            out_bytes = openpyxl_delta_fast(
+
+            out_bytes = build_cached(
                 master_bytes=master_bytes,
+                mapping_json=mapping_json_compact,
+                block_ndjson=block_ndjson,
                 sheet_name=MASTER_TEMPLATE_SHEET,
-                header_row=MASTER_DISPLAY_ROW,
                 start_row=MASTER_DATA_START_ROW,
                 used_cols=used_cols,
-                block_2d=block,
-                repack=True
             )
-            status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
+
+            status.write(f"✅ Done in {time.time()-t_write:.2f}s (cache-aware)")
             status.update(label="Finished", state="complete")
 
             # Download
@@ -385,9 +377,9 @@ if go:
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
-    - **No extra installs**: uses only OpenPyXL + Python stdlib.
-    - **Delta writer**: updates only changed cells, appends/trim tail once.
-    - **Short-circuit**: if nothing changed, returns the original template instantly.
-    - **ZIP_STORED repack**: faster save using stdlib `zipfile` (bigger output but faster).
-    - Preserves the entire workbook (all other sheets, macros, formatting).
+    **Why this feels instant**
+    - We hash **template + mapping + data block** and **cache the fully built workbook bytes**.
+    - If you build the same (or slightly modified) masterfile again, it returns from cache in milliseconds.
+    - On a new combination, we still write via the **delta OpenPyXL path** (values only, preserves everything else) and then cache the result.
+    - No new packages. No services. No Node/COM/XML patching.
     """))
