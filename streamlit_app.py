@@ -1,3 +1,4 @@
+# streamlit_app.py
 import io
 import json
 import re
@@ -19,7 +20,6 @@ st.set_page_config(
     page_icon="🧾",
     layout="wide",
 )
-
 st.markdown("""
 <style>
 .section{border:1px solid #e8eef6;background:#fff;border-radius:16px;padding:18px;margin:12px 0;box-shadow:0 6px 24px rgba(2,6,23,.05)}
@@ -36,7 +36,7 @@ MASTER_SECONDARY_ROW  = 3            # subheaders row (e.g. bullet_point labels)
 MASTER_DATA_START_ROW = 4            # first data row to write
 
 # ─────────────────────────────────────────────────────────────────────
-# XML fast writer helpers (Linux-friendly, cloud-safe)
+# Namespaces / helpers for XML fast writer
 # ─────────────────────────────────────────────────────────────────────
 XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -47,7 +47,7 @@ ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetm
 
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
 
-def sanitize_xml_text(s) -> str:
+def sanitize_xml_text(s):
     if s is None:
         return ""
     return _INVALID_XML_CHARS.sub("", str(s))
@@ -72,15 +72,13 @@ def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     rid = None
     for sh in wb_xml.find(f"{{{XL_NS_MAIN}}}sheets"):
         if sh.attrib.get("name") == sheet_name:
-            rid = sh.attrib.get(f"{{{XL_NS_REL}}}id")
-            break
+            rid = sh.attrib.get(f"{{{XL_NS_REL}}}id"); break
     if not rid:
         raise ValueError(f"Sheet '{sheet_name}' not found.")
     target = None
     for rel in rels_xml:
         if rel.attrib.get("Id") == rid:
-            target = rel.attrib.get("Target")
-            break
+            target = rel.attrib.get("Target"); break
     if not target:
         raise ValueError(f"Relationship for sheet '{sheet_name}' not found.")
     target = target.replace("\\", "/")
@@ -90,8 +88,7 @@ def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
 
 def _get_table_paths_for_sheet(z: zipfile.ZipFile, sheet_path: str) -> list:
     rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/").replace(".xml", ".xml.rels")
-    if rels_path not in z.namelist():
-        return []
+    if rels_path not in z.namelist(): return []
     root = ET.fromstring(z.read(rels_path))
     out = []
     for rel in root:
@@ -107,8 +104,7 @@ def _read_table_cols_count(table_xml_bytes: bytes) -> int:
     try:
         root = ET.fromstring(table_xml_bytes)
         tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
-        if tcols is None:
-            return 0
+        if tcols is None: return 0
         count_attr = tcols.attrib.get("count")
         try:
             count = int(count_attr) if count_attr is not None else 0
@@ -134,28 +130,35 @@ def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     u_last_row = max(orig_last_row, last_row)
     return f"A1:{_col_letter(u_last_col)}{u_last_row}"
 
-def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
-                     used_cols_final: int, block_2d: list) -> tuple[bytes, set]:
+# ─────────────────────────────────────────────────────────────────────
+# PATCH: sheet XML (rows + cleanup of stale ranges)
+# ─────────────────────────────────────────────────────────────────────
+def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, block_2d):
+    """
+    Rewrites data rows and cleans up any ranges that point into the replaced block
+    (mergeCells, dataValidations, conditionalFormatting, hyperlinks, rowBreaks).
+    Returns: (patched_sheet_xml_bytes, kept_hyperlink_rIds_set)
+    """
     root = ET.fromstring(sheet_xml_bytes)
     ns = XL_NS_MAIN
 
-    def in_replaced_block(ref: str) -> bool:
-        def _any_row(rng: str) -> bool:
+    def in_replaced_block(ref):
+        # True if any address in ref (can be "A1" or "A1:C20 A25") touches rows >= start_row
+        def _any_row(rng):
             rng = rng.strip()
             if not rng: return False
             parts = rng.split(":")
-            def _row(addr: str) -> int:
+            def _row(addr):
                 m = re.match(r"([A-Z]+)(\d+)$", addr)
                 return int(m.group(2)) if m else 10**9
             if len(parts) == 1:
                 return _row(parts[0]) >= start_row
-            else:
-                r1, r2 = _row(parts[0]), _row(parts[1])
-                lo, hi = min(r1, r2), max(r1, r2)
-                return hi >= start_row
-        return any(_any_row(tok) for tok in ref.split())
+            r1, r2 = _row(parts[0]), _row(parts[1])
+            lo, hi = min(r1, r2), max(r1, r2)
+            return hi >= start_row
+        return any(_any_row(tok) for tok in str(ref).split())
 
-    # ---------------- sheetData: rewrite data rows ----------------
+    # -------- sheetData: drop existing rows >= start_row, then append new rows
     sheetData = root.find(f"{{{ns}}}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{ns}}}sheetData")
@@ -181,7 +184,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
             txt = sanitize_xml_text(v)
             if not txt: continue
             any_val = True
-            col = _col_letter(j+1)
+            col = _col_letter(j + 1)
             c = ET.Element(f"{{{ns}}}c", r=f"{col}{r}", t="inlineStr")
             is_el = ET.SubElement(c, f"{{{ns}}}is")
             t_el = ET.SubElement(is_el, f"{{{ns}}}t")
@@ -191,7 +194,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
         if any_val:
             sheetData.append(row_el)
 
-    # dimension
+    # -------- dimension: union with original
     dim = root.find(f"{{{ns}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{ns}}}dimension")
@@ -199,30 +202,28 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
     last_row = start_row + max(0, len(block_2d) - 1)
     dim.set("ref", _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row))
 
-    # ---------------- remove/retain objects that intersect the replaced block ----------------
-    # 1) mergeCells
+    # -------- remove stale structures that intersect the replaced block
+    # mergeCells
     mcs = root.find(f"{{{ns}}}mergeCells")
     if mcs is not None:
         for mc in list(mcs):
-            ref = mc.attrib.get("ref", "")
-            if in_replaced_block(ref):
+            if in_replaced_block(mc.attrib.get("ref", "")):
                 mcs.remove(mc)
-        count = len(list(mcs))
-        if count: mcs.set("count", str(count))
+        cnt = len(list(mcs))
+        if cnt: mcs.set("count", str(cnt))
         else: root.remove(mcs)
 
-    # 2) dataValidations
+    # dataValidations
     dvs = root.find(f"{{{ns}}}dataValidations")
     if dvs is not None:
         for dv in list(dvs):
-            ref = dv.attrib.get("sqref", "")
-            if in_replaced_block(ref):
+            if in_replaced_block(dv.attrib.get("sqref", "")):
                 dvs.remove(dv)
-        count = len(list(dvs))
-        if count: dvs.set("count", str(count))
+        cnt = len(list(dvs))
+        if cnt: dvs.set("count", str(cnt))
         else: root.remove(dvs)
 
-    # 3) conditionalFormatting
+    # conditionalFormatting (filter sqref tokens)
     for cf in list(root.findall(f"{{{ns}}}conditionalFormatting")):
         sqref = cf.attrib.get("sqref", "")
         if not sqref: continue
@@ -230,8 +231,8 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
         if kept: cf.set("sqref", kept)
         else: root.remove(cf)
 
-    # 4) hyperlinks — track kept r:ids so we can fix .rels
-    kept_hl_ids: set[str] = set()
+    # hyperlinks — keep track of relationship IDs we still reference
+    kept_hl_ids = set()
     hls = root.find(f"{{{ns}}}hyperlinks")
     if hls is not None:
         for hl in list(hls):
@@ -244,7 +245,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
         if not list(hls):
             root.remove(hls)
 
-    # 5) rowBreaks
+    # rowBreaks (page breaks)
     rbr = root.find(f"{{{ns}}}rowBreaks")
     if rbr is not None:
         for brk in list(rbr):
@@ -259,23 +260,50 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True), kept_hl_ids
 
-
-def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
+# ─────────────────────────────────────────────────────────────────────
+# PATCH: table XML (range + columns sync)
+# ─────────────────────────────────────────────────────────────────────
+def _patch_table_xml(table_xml_bytes, header_row, last_row, last_col_n):
+    """
+    Sync table range + autofilter and ensure <tableColumns> has enough children.
+    """
     root = ET.fromstring(table_xml_bytes)
+    ns = XL_NS_MAIN
+
     new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
-    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
+    af = root.find(f"{{{ns}}}autoFilter")
     if af is None:
-        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
+        af = ET.SubElement(root, f"{{{ns}}}autoFilter")
     af.set("ref", new_ref)
-    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
-    if tcols is not None:
-        child_count = sum(1 for _ in tcols)
-        new_count = max(child_count, last_col_n)
-        tcols.set("count", str(new_count))
+
+    tcols = root.find(f"{{{ns}}}tableColumns")
+    if tcols is None:
+        tcols = ET.SubElement(root, f"{{{ns}}}tableColumns")
+
+    existing = list(tcols)
+    child_count = len(existing)
+    max_id = 0
+    for tc in existing:
+        try:
+            max_id = max(max_id, int(tc.attrib.get("id", "0")))
+        except Exception:
+            pass
+
+    # Append missing tableColumn nodes so children == width
+    for i in range(child_count + 1, last_col_n + 1):
+        max_id += 1
+        tc = ET.SubElement(tcols, f"{{{ns}}}tableColumn")
+        tc.set("id", str(max_id))
+        tc.set("name", f"Column{i}")
+
+    tcols.set("count", str(len(list(tcols))))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    
-    def _patch_sheet_rels(rels_xml_bytes, kept_hyperlink_ids):
+
+# ─────────────────────────────────────────────────────────────────────
+# PATCH: sheet relationships (remove orphan hyperlink rels)
+# ─────────────────────────────────────────────────────────────────────
+def _patch_sheet_rels(rels_xml_bytes, kept_hyperlink_ids):
     """Remove hyperlink Relationships that are no longer referenced by the sheet."""
     try:
         ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -285,7 +313,6 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
         for rel in list(root.findall(f"{{{ns_pkg}}}Relationship")):
             rel_type = rel.attrib.get("Type", "")
             rid = rel.attrib.get("Id")
-            # Only hyperlinks live here with this type; remove if not kept
             if rel_type.endswith("/hyperlink") and rid and rid not in kept_hyperlink_ids:
                 root.remove(rel)
                 changed = True
@@ -293,13 +320,18 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
             return ET.tostring(root, encoding="utf-8", xml_declaration=True)
         return rels_xml_bytes
     except Exception:
-        # If parse fails, return original to avoid making things worse
+        # If parsing fails, return original to avoid making things worse
         return rels_xml_bytes
-        
-   def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_cols, block_2d):
+
+# ─────────────────────────────────────────────────────────────────────
+# PATCH: pack everything (drop calcChain + update defined names)
+# ─────────────────────────────────────────────────────────────────────
+def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_cols, block_2d):
     """
     Patch only 'sheet_name' data rows; keep all other parts untouched.
-    - Sync tables
+    - Rewrite data rows
+    - Clean stale ranges (merges/validations/CF/hyperlinks/pagebreaks)
+    - Sync tables (range + tableColumns)
     - Update workbook defined name _xlnm._FilterDatabase for this sheet
     - Drop calcChain (Excel rebuilds silently)
     - Remove orphan hyperlink relationships in sheet rels
@@ -376,29 +408,24 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
 
             # write patched parts
             if name == sheet_path:
-                zout.writestr(item, new_sheet_xml)
-                continue
+                zout.writestr(item, new_sheet_xml); continue
             if name in patched_tables:
-                zout.writestr(item, patched_tables[name])
-                continue
+                zout.writestr(item, patched_tables[name]); continue
             if name == "xl/workbook.xml":
-                zout.writestr(item, wb_xml_bytes)
-                continue
+                zout.writestr(item, wb_xml_bytes); continue
             # drop calcChain
             if name == "xl/calcChain.xml":
                 continue
-            # hold [Content_Types].xml for patching calcChain override
+            # hold [Content_Types].xml for calcChain override patch
             if name == "[Content_Types].xml":
-                content_types_bytes = zin.read(name)
-                continue
+                content_types_bytes = zin.read(name); continue
             # patch sheet rels to remove orphan hyperlink relationships
             if name == sheet_rels_path:
                 orig_rels = zin.read(name)
                 patched_rels = _patch_sheet_rels(orig_rels, kept_hl_ids)
-                zout.writestr(item, patched_rels)
-                continue
+                zout.writestr(item, patched_rels); continue
 
-            # copy all others byte-for-byte
+            # copy all others
             zout.writestr(item, zin.read(name))
 
         # patch [Content_Types].xml: remove calcChain override if present
@@ -410,66 +437,18 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
                 changed = False
                 for ov in list(ct_root.findall(f"{{{ns_pkg}}}Override")):
                     if ov.attrib.get("PartName", "").replace("\\", "/") == "/xl/calcChain.xml":
-                        ct_root.remove(ov)
-                        changed = True
-                if changed:
-                    ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True)
-                else:
-                    ct_bytes = content_types_bytes
+                        ct_root.remove(ov); changed = True
+                ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True) if changed else content_types_bytes
                 zout.writestr("[Content_Types].xml", ct_bytes)
             except Exception:
-                # If content types parsing fails, write original
                 zout.writestr("[Content_Types].xml", content_types_bytes)
 
     zin.close()
     out_bio.seek(0)
     return out_bio.getvalue()
 
-def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
-    """Patch only 'sheet_name' data rows; keep all other parts untouched."""
-    zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
-    sheet_path = _find_sheet_part_path(zin, sheet_name)
-    table_paths = _get_table_paths_for_sheet(zin, sheet_path)
-
-    # Respect widest table definition, if any
-    max_cols = used_cols
-    for tp in table_paths:
-        try:
-            cnt = _read_table_cols_count(zin.read(tp))
-            if cnt and cnt > max_cols:
-                max_cols = cnt
-        except Exception:
-            pass
-
-    original_sheet_xml = zin.read(sheet_path)
-    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
-
-    last_row = start_row + max(0, len(block_2d) - 1)
-    if last_row < header_row:
-        last_row = header_row
-
-    patched_tables = {}
-    for tp in table_paths:
-        try:
-            patched_tables[tp] = _patch_table_xml(zin.read(tp), header_row, last_row, max_cols)
-        except Exception:
-            pass
-
-    out_bio = io.BytesIO()
-    with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == sheet_path:
-                data = new_sheet_xml
-            elif item.filename in patched_tables:
-                data = patched_tables[item.filename]
-            zout.writestr(item, data)
-    zin.close()
-    out_bio.seek(0)
-    return out_bio.getvalue()
-
 # ─────────────────────────────────────────────────────────────────────
-# General helpers
+# General helpers (mapping + onboarding)
 # ─────────────────────────────────────────────────────────────────────
 def norm(s: str) -> str:
     if s is None:
@@ -521,7 +500,7 @@ with st.container():
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
-mapping_json_text, mapping_json_file = "", None
+mapping_json_text = ""
 with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
                                      placeholder='{\n  "Partner SKU": ["Seller SKU","item_sku"]\n}')
@@ -697,6 +676,10 @@ if go:
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
     - **Only the `{MASTER_TEMPLATE_SHEET}` sheet is modified** via an XML fast patch; all other sheets/macros/styles stay intact.
-    - Table ranges and autofilter on the Template sheet are auto-synchronized to the new data size.
-    - Invalid XML characters are removed to avoid Excel "repair" prompts.
+    - Fixes included to prevent Excel repair popups:
+      - Remove stale *mergeCells*, *dataValidations*, *conditionalFormatting*, *hyperlinks*, and page breaks intersecting the replaced area.
+      - Sync table range + `<tableColumns>` children and `autoFilter`.
+      - Update workbook defined name `_xlnm._FilterDatabase` for the sheet.
+      - Drop `xl/calcChain.xml` + its content-type so Excel rebuilds silently.
+      - Remove orphan hyperlink relationships in `sheetX.xml.rels`.
     """))
