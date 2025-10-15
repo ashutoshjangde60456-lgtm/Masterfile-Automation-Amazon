@@ -1,4 +1,3 @@
-# streamlit_app.py
 import io
 import json
 import re
@@ -12,11 +11,25 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
+# Try optional speed libs (read acceleration)
+try:
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+    _HAS_ARROW = True
+except Exception:
+    _HAS_ARROW = False
+
+try:
+    import pyxlsb  # noqa: F401 (engine used by pandas)
+    _HAS_PYXLSB = True
+except Exception:
+    _HAS_PYXLSB = False
+
 # ─────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation – Hybrid XML Writer (Template-only)",
+    page_title="Masterfile Automation – Fast XML Writer + Read Acceleration",
     page_icon="🧾",
     layout="wide",
 )
@@ -32,7 +45,7 @@ div.stButton>button,.stDownloadButton>button{background:#2563eb!important;color:
 # ─────────────────────────────────────────────────────────────────────
 MASTER_TEMPLATE_SHEET = "Template"   # write only here
 MASTER_DISPLAY_ROW    = 2            # header row
-MASTER_SECONDARY_ROW  = 3            # subheader row (e.g., bullet_point1..)
+MASTER_SECONDARY_ROW  = 3            # subheader row
 MASTER_DATA_START_ROW = 4            # first data row
 
 XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -80,6 +93,7 @@ def nonempty_rows(df: pd.DataFrame) -> int:
 
 def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
     uploaded_file.seek(0)
+    # pandas engine chosen by file type; this only enumerates sheet names when Excel
     xl = pd.ExcelFile(uploaded_file, engine="openpyxl")
     best, best_score, best_info = None, -1, ""
     for sheet in xl.sheet_names:
@@ -122,7 +136,7 @@ def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     target = target.replace("\\", "/")
     if target.startswith("../"): target = target[3:]
     if not target.startswith("xl/"): target = "xl/" + target
-    return target  # e.g. xl/worksheets/sheet1.xml
+    return target
 
 def _get_table_paths_for_sheet(z: zipfile.ZipFile, sheet_path: str) -> list:
     rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/").replace(".xml", ".xml.rels")
@@ -169,36 +183,9 @@ def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     return f"A1:{_col_letter(u_last_col)}{u_last_row}"
 
 # ─────────────────────────────────────────────────────────────────────
-# Range helpers (definedNames scrub)
-# ─────────────────────────────────────────────────────────────────────
-def _range_intersects_rows(ref_text: str, start_row: int) -> bool:
-    # ref_text can be "A1", "A1:C20", "'Template'!$A$2:$Z$999", or space separated sqref
-    if not ref_text:
-        return False
-    def _row(addr: str) -> int:
-        addr = addr.split("!")[-1].replace("$", "")
-        m = re.match(r"([A-Z]+)(\d+)$", addr)
-        return int(m.group(2)) if m else 10**9
-    for tok in str(ref_text).split():
-        parts = tok.split(":")
-        if len(parts) == 1:
-            if _row(parts[0]) >= start_row:
-                return True
-        else:
-            r1, r2 = _row(parts[0]), _row(parts[1])
-            if max(r1, r2) >= start_row:
-                return True
-    return False
-
-# ─────────────────────────────────────────────────────────────────────
 # Sheet XML patch (rows + cleanup)
 # ─────────────────────────────────────────────────────────────────────
 def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, block_2d):
-    """
-    Rewrites data rows and cleans up any ranges that point into the replaced block
-    (mergeCells, dataValidations, conditionalFormatting, hyperlinks, rowBreaks).
-    Returns: (patched_sheet_xml_bytes, kept_hyperlink_rIds_set)
-    """
     root = ET.fromstring(sheet_xml_bytes)
     ns = XL_NS_MAIN
 
@@ -216,10 +203,10 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
             return max(r1, r2) >= start_row
         return any(_any_row(tok) for tok in str(ref).split())
 
-    # sheetData: drop rows ≥ start_row, then append new rows
     sheetData = root.find(f"{{{ns}}}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{ns}}}sheetData")
+
     for row in list(sheetData):
         try: r = int(row.attrib.get("r", "0") or "0")
         except Exception: r = 0
@@ -249,7 +236,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
         if any_val:
             sheetData.append(row_el)
 
-    # dimension union
     dim = root.find(f"{{{ns}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{ns}}}dimension")
@@ -257,7 +243,7 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
     last_row = start_row + max(0, len(block_2d) - 1)
     dim.set("ref", _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row))
 
-    # mergeCells cleanup
+    # Clean stale structures
     mcs = root.find(f"{{{ns}}}mergeCells")
     if mcs is not None:
         for mc in list(mcs):
@@ -267,7 +253,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
         if cnt: mcs.set("count", str(cnt))
         else: root.remove(mcs)
 
-    # dataValidations cleanup
     dvs = root.find(f"{{{ns}}}dataValidations")
     if dvs is not None:
         for dv in list(dvs):
@@ -277,7 +262,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
         if cnt: dvs.set("count", str(cnt))
         else: root.remove(dvs)
 
-    # conditionalFormatting cleanup
     for cf in list(root.findall(f"{{{ns}}}conditionalFormatting")):
         sqref = cf.attrib.get("sqref", "")
         if not sqref: continue
@@ -285,7 +269,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
         if kept: cf.set("sqref", kept)
         else: root.remove(cf)
 
-    # hyperlinks: keep list of r:ids we still reference
     kept_hl_ids = set()
     hls = root.find(f"{{{ns}}}hyperlinks")
     if hls is not None:
@@ -299,7 +282,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
         if not list(hls):
             root.remove(hls)
 
-    # rowBreaks cleanup
     rbr = root.find(f"{{{ns}}}rowBreaks")
     if rbr is not None:
         for brk in list(rbr):
@@ -312,9 +294,6 @@ def _patch_sheet_xml(sheet_xml_bytes, header_row, start_row, used_cols_final, bl
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True), kept_hl_ids
 
-# ─────────────────────────────────────────────────────────────────────
-# Table XML patch (range + columns sync)
-# ─────────────────────────────────────────────────────────────────────
 def _patch_table_xml(table_xml_bytes, header_row, last_row, last_col_n):
     root = ET.fromstring(table_xml_bytes)
     ns = XL_NS_MAIN
@@ -339,7 +318,6 @@ def _patch_table_xml(table_xml_bytes, header_row, last_row, last_col_n):
         except Exception:
             pass
 
-    # ensure <tableColumn> count matches width
     for i in range(child_count + 1, last_col_n + 1):
         max_id += 1
         tc = ET.SubElement(tcols, f"{{{ns}}}tableColumn")
@@ -349,9 +327,6 @@ def _patch_table_xml(table_xml_bytes, header_row, last_row, last_col_n):
     tcols.set("count", str(len(list(tcols))))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
-# ─────────────────────────────────────────────────────────────────────
-# Sheet relationships patch (remove orphan hyperlinks)
-# ─────────────────────────────────────────────────────────────────────
 def _patch_sheet_rels(rels_xml_bytes, kept_hyperlink_ids):
     try:
         ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -369,9 +344,24 @@ def _patch_sheet_rels(rels_xml_bytes, kept_hyperlink_ids):
     except Exception:
         return rels_xml_bytes
 
-# ─────────────────────────────────────────────────────────────────────
-# Workbook definedNames patch (update FilterDatabase + scrub locals)
-# ─────────────────────────────────────────────────────────────────────
+def _range_intersects_rows(ref_text: str, start_row: int) -> bool:
+    if not ref_text:
+        return False
+    def _row(addr: str) -> int:
+        addr = addr.split("!")[-1].replace("$", "")
+        m = re.match(r"([A-Z]+)(\d+)$", addr)
+        return int(m.group(2)) if m else 10**9
+    for tok in str(ref_text).split():
+        parts = tok.split(":")
+        if len(parts) == 1:
+            if _row(parts[0]) >= start_row:
+                return True
+        else:
+            r1, r2 = _row(parts[0]), _row(parts[1])
+            if max(r1, r2) >= start_row:
+                return True
+    return False
+
 def _patch_defined_names_wide(wb_root: ET.Element, sheet_name: str,
                               local_sheet_id: int,
                               header_row: int, last_row: int, last_col_n: int) -> ET.Element:
@@ -379,19 +369,15 @@ def _patch_defined_names_wide(wb_root: ET.Element, sheet_name: str,
     dnames = wb_root.find(f"{{{ns}}}definedNames")
     if dnames is None:
         return wb_root
-
     new_ref_abs = f"'{sheet_name}'!$A${header_row}:${_col_letter(last_col_n)}${last_row}"
     to_remove = []
     for dn in list(dnames):
         lsid = dn.attrib.get("localSheetId")
         if lsid is None or str(lsid) != str(local_sheet_id):
-            continue  # not our sheet
+            continue
         name = dn.attrib.get("name")
         if name == "_xlnm._FilterDatabase":
-            dn.text = new_ref_abs
-            dn.set("hidden", "1")
-            continue
-        # Remove other local names that intersect replaced block
+            dn.text = new_ref_abs; dn.set("hidden", "1"); continue
         ref_txt = (dn.text or "").strip()
         if _range_intersects_rows(ref_txt, header_row):
             to_remove.append(dn)
@@ -399,13 +385,9 @@ def _patch_defined_names_wide(wb_root: ET.Element, sheet_name: str,
         dnames.remove(dn)
     return wb_root
 
-# ─────────────────────────────────────────────────────────────────────
-# Fast patch packer (includes tables, rels, content types, definedNames)
-# ─────────────────────────────────────────────────────────────────────
 def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_cols, block_2d):
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
 
-    # workbook + locate sheet index (localSheetId)
     wb_xml = ET.fromstring(zin.read("xl/workbook.xml"))
     sheets_el = wb_xml.find(f"{{{XL_NS_MAIN}}}sheets")
     sheet_elems = list(sheets_el) if sheets_el is not None else []
@@ -416,12 +398,10 @@ def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_co
     if local_id is None:
         raise ValueError(f"Sheet '{sheet_name}' not found in workbook.xml")
 
-    # locate parts
     sheet_path = _find_sheet_part_path(zin, sheet_name)
     sheet_rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/").replace(".xml", ".xml.rels")
     table_paths = _get_table_paths_for_sheet(zin, sheet_path)
 
-    # width respecting tables
     max_cols = used_cols
     for tp in table_paths:
         try:
@@ -431,16 +411,13 @@ def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_co
         except Exception:
             pass
 
-    # patch sheet xml (collect kept hyperlink r:ids)
     original_sheet_xml = zin.read(sheet_path)
     new_sheet_xml, kept_hl_ids = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
 
-    # last row for ranges
     last_row = start_row + max(0, len(block_2d) - 1)
     if last_row < header_row:
         last_row = header_row
 
-    # patch tables
     patched_tables = {}
     for tp in table_paths:
         try:
@@ -448,7 +425,6 @@ def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_co
         except Exception:
             pass
 
-    # patch defined names (FilterDatabase + scrub local names)
     wb_xml_patched = _patch_defined_names_wide(
         wb_root=wb_xml,
         sheet_name=sheet_name,
@@ -462,32 +438,23 @@ def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_co
     out_bio = io.BytesIO()
     with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
         content_types_bytes = None
-
         for item in zin.infolist():
             name = item.filename
-
             if name == sheet_path:
                 zout.writestr(item, new_sheet_xml); continue
             if name in patched_tables:
                 zout.writestr(item, patched_tables[name]); continue
             if name == "xl/workbook.xml":
                 zout.writestr(item, wb_xml_bytes); continue
-            # drop calcChain (Excel rebuilds silently)
             if name == "xl/calcChain.xml":
                 continue
-            # defer [Content_Types].xml
             if name == "[Content_Types].xml":
                 content_types_bytes = zin.read(name); continue
-            # patch sheet rels to remove orphan hyperlink rels
             if name == sheet_rels_path:
                 orig_rels = zin.read(name)
                 patched_rels = _patch_sheet_rels(orig_rels, kept_hl_ids)
                 zout.writestr(item, patched_rels); continue
-
-            # copy others byte-for-byte
             zout.writestr(item, zin.read(name))
-
-        # patch [Content_Types].xml: remove calcChain override if present
         if content_types_bytes is not None:
             try:
                 ns_pkg = "http://schemas.openxmlformats.org/package/2006/content-types"
@@ -507,48 +474,53 @@ def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_co
     return out_bio.getvalue()
 
 # ─────────────────────────────────────────────────────────────────────
-# Lightweight validation + safe fallback (OpenPyXL)
+# Read acceleration: onboarding loader
 # ─────────────────────────────────────────────────────────────────────
-def validate_excel_zip(xlsx_bytes: bytes) -> bool:
-    try:
-        z = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
-        for part in ("[Content_Types].xml", "xl/workbook.xml"):
-            if part not in z.namelist():
-                return False
-        # parse workbook + all sheet xmls
-        ET.fromstring(z.read("xl/workbook.xml"))
-        for name in z.namelist():
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
-                ET.fromstring(z.read(name))
-        return True
-    except Exception:
-        return False
+def load_onboarding_fast(uploaded_file) -> pd.DataFrame:
+    """
+    Fast path for onboarding:
+      - .csv  -> pyarrow.csv (if available) else pandas.read_csv
+      - .xlsb -> pandas.read_excel(engine='pyxlsb') (if available)
+      - .xlsx/.xlsm -> pandas.read_excel(engine='openpyxl')
+    Returns a dataframe with all values as strings (no NaNs).
+    """
+    name = uploaded_file.name if hasattr(uploaded_file, "name") else "data"
+    suffix = Path(name).suffix.lower()
 
-def safe_openpyxl_write(master_bytes, sheet_name, header_row, start_row, used_cols, block_2d):
-    wb = load_workbook(io.BytesIO(master_bytes), keep_vba=True)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"Sheet '{sheet_name}' not found.")
-    ws = wb[sheet_name]
-    maxr = ws.max_row or start_row
-    if maxr >= start_row:
-        ws.delete_rows(start_row, maxr - start_row + 1)
-    for row in block_2d:
-        ws.append(row[:used_cols])
-    out = io.BytesIO(); wb.save(out); out.seek(0)
-    return out.getvalue()
+    uploaded_file.seek(0)
+    if suffix == ".csv":
+        if _HAS_ARROW:
+            # Read via pyarrow, then to pandas (fast & low memory)
+            table = pacsv.read_csv(uploaded_file)
+            df = table.to_pandas(types_mapper=pd.ArrowDtype).astype(str).fillna("")
+        else:
+            df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False).fillna("")
+        return df
+
+    # Excel paths
+    uploaded_file.seek(0)
+    if suffix == ".xlsb" and _HAS_PYXLSB:
+        # Binary Excel: much faster than openpyxl
+        df = pd.read_excel(uploaded_file, engine="pyxlsb", dtype=str).fillna("")
+        return df
+
+    # Fallback for .xlsx/.xlsm and anything else readable by openpyxl
+    uploaded_file.seek(0)
+    df = pd.read_excel(uploaded_file, engine="openpyxl", dtype=str).fillna("")
+    return df
 
 # ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation – Hybrid (Fast XML + Safe Fallback)")
-st.caption("Writes only the Template sheet. Preserves other sheets/macros/styles. Cloud-safe.")
+st.title("🧾 Masterfile Automation – Fast XML (Template-only) + Read Acceleration")
+st.caption("Reads large onboarding files faster (.xlsb via pyxlsb, .csv via pyarrow). Writes Template only; preserves other sheets/macros/styles.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
     with c1:
         masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx","xlsm"])
     with c2:
-        onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
+        onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx / .xlsm / .xlsb / .csv)", type=["xlsx","xlsm","xlsb","csv"])
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
@@ -574,18 +546,23 @@ if go:
             # Parse mapping
             status.update(label="Parsing mapping JSON…")
             mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
-            mapping_aliases = {norm(k): (v if isinstance(v, list) else [v]) + [k] for k, v in mapping_raw.items()}
+            mapping_aliases = {}
+            for k, v in mapping_raw.items():
+                aliases = v[:] if isinstance(v, list) else [v]
+                if k not in aliases: aliases.append(k)
+                mapping_aliases[norm(k)] = aliases
 
-            # Read Template headers
+            # Read Template headers (read-only)
             status.update(label="Reading template headers…")
-            masterfile_file.seek(0); master_bytes = masterfile_file.read()
+            masterfile_file.seek(0)
+            master_bytes = masterfile_file.read()
+            t0 = time.time()
             wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
             if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
                 st.error(f"Sheet '{MASTER_TEMPLATE_SHEET}' not found in template.")
                 status.update(state="error"); st.stop()
             ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
 
-            # Detect used columns based on both header rows
             def worksheet_used_cols(ws, header_rows=(1,), hard_cap=4096, empty_streak_stop=8):
                 max_try = min(ws.max_column or 1, hard_cap)
                 last_nonempty, streak = 0, 0
@@ -602,63 +579,92 @@ if go:
             display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
             secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
             wb_ro.close()
-            status.write(f"✅ Template headers loaded ({used_cols} columns)")
+            status.write(f"✅ Template headers loaded ({used_cols} columns) in {time.time()-t0:.2f}s")
 
-            # Read onboarding
-            status.update(label="Reading onboarding…")
-            onboarding_file.seek(0)
-            df = pd.read_excel(onboarding_file, engine="openpyxl").fillna("")
-            status.write(f"✅ Onboarding rows: {len(df)}")
+            # Read onboarding with acceleration
+            status.update(label="Reading onboarding (accelerated)…")
+            t_read = time.time()
+            df = load_onboarding_fast(onboarding_file)
+            on_headers = list(df.columns)
+            status.write(f"✅ Onboarding loaded ({len(df)} rows, {len(on_headers)} columns) in {time.time()-t_read:.2f}s")
 
-            # Build data block (stringified)
-            block = df.astype(str).values.tolist()
+            # Build mapping master -> source
+            status.update(label="Resolving mapping…")
+            from difflib import SequenceMatcher
+            def top_matches(query, candidates, k=3):
+                q = norm(query)
+                scored = [(SequenceMatcher(None, q, norm(c)).ratio(), c) for c in candidates]
+                scored.sort(key=lambda t: t[0], reverse=True)
+                return scored[:k]
 
-            # 🚦 Hybrid write: try XML fast writer, then validate, else fallback
-            status.update(label="Writing via XML fast patch…")
-            t0 = time.time()
-            try:
-                xml_bytes = fast_patch_template(
-                    master_bytes=master_bytes,
-                    sheet_name=MASTER_TEMPLATE_SHEET,
-                    header_row=MASTER_DISPLAY_ROW,
-                    start_row=MASTER_DATA_START_ROW,
-                    used_cols=used_cols,
-                    block_2d=block
-                )
-                if validate_excel_zip(xml_bytes):
-                    out_bytes = xml_bytes
-                    status.write(f"✅ XML fast patch succeeded in {time.time()-t0:.2f}s (validated clean)")
+            SENTINEL_LIST = object()
+            series_by_alias = {norm(h): df[h] for h in on_headers}
+            master_to_source, report_lines = {}, []
+            BULLET_DISP_N = norm("Key Product Features")
+
+            for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
+                disp_norm, sec_norm = norm(disp), norm(sec)
+                if disp_norm == BULLET_DISP_N and sec_norm:
+                    effective, label = sec, f"{disp} ({sec})"
                 else:
-                    status.write("⚠️ XML output failed validation — switching to safe OpenPyXL mode…")
-                    t1 = time.time()
-                    out_bytes = safe_openpyxl_write(
-                        master_bytes=master_bytes,
-                        sheet_name=MASTER_TEMPLATE_SHEET,
-                        header_row=MASTER_DISPLAY_ROW,
-                        start_row=MASTER_DATA_START_ROW,
-                        used_cols=used_cols,
-                        block_2d=block
-                    )
-                    status.write(f"✅ Safe OpenPyXL rewrite finished in {time.time()-t1:.2f}s")
-            except Exception as e:
-                status.write(f"⚠️ XML fast patch error ({e}) — switching to safe OpenPyXL mode…")
-                t1 = time.time()
-                out_bytes = safe_openpyxl_write(
-                    master_bytes=master_bytes,
-                    sheet_name=MASTER_TEMPLATE_SHEET,
-                    header_row=MASTER_DISPLAY_ROW,
-                    start_row=MASTER_DATA_START_ROW,
-                    used_cols=used_cols,
-                    block_2d=block
-                )
-                status.write(f"✅ Safe OpenPyXL rewrite finished in {time.time()-t1:.2f}s")
+                    effective, label = disp, disp
+                eff_norm = norm(effective)
+                if not eff_norm: continue
 
+                aliases = mapping_aliases.get(eff_norm, [effective])
+                resolved = None
+                for a in aliases:
+                    s = series_by_alias.get(norm(a))
+                    if s is not None:
+                        resolved = s; report_lines.append(f"- ✅ **{label}** ← `{a}`"); break
+                if resolved is not None:
+                    master_to_source[c] = resolved
+                else:
+                    if disp_norm == norm("Listing Action (List or Unlist)"):
+                        master_to_source[c] = SENTINEL_LIST
+                        report_lines.append(f"- 🟨 **{label}** ← default `'List'`")
+                    else:
+                        sugg = top_matches(effective, on_headers, 3)
+                        sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "none"
+                        report_lines.append(f"- ❌ **{label}** ← no match. Suggestions: {sug_txt}")
+
+            status.write("**Mapping summary**")
+            for line in report_lines: status.write(line)
+
+            # Build 2D block (string values)
+            status.update(label="Building data block…")
+            n_rows = len(df)
+            block = [[""] * used_cols for _ in range(n_rows)]
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    for i in range(n_rows):
+                        block[i][col-1] = "List"
+                else:
+                    vals = src.astype(str).tolist()
+                    m = min(len(vals), n_rows)
+                    for i in range(m):
+                        v = vals[i].strip()
+                        if v and v.lower() not in ("nan", "none", ""):
+                            block[i][col-1] = v
+
+            # ⚡ XML fast patch write (preserve other sheets/styles/macros)
+            status.update(label="Writing (XML fast patch)…")
+            t_write = time.time()
+            out_bytes = fast_patch_template(
+                master_bytes=master_bytes,
+                sheet_name=MASTER_TEMPLATE_SHEET,
+                header_row=MASTER_DISPLAY_ROW,
+                start_row=MASTER_DATA_START_ROW,
+                used_cols=used_cols,
+                block_2d=block
+            )
+            status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
             status.update(label="Finished", state="complete")
 
             # Download
             ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
-            mime = "application/vnd.ms-excel.sheet.macroEnabled.12" if ext == ".xlsm" \
-                else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime = "application/vnd.ms-excel.sheet.macroEnabled.12" if ext == ".xlsm" else \
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             download_placeholder.download_button(
                 "⬇️ Download Final Masterfile",
                 data=out_bytes,
@@ -675,15 +681,16 @@ if go:
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
-    **What this does**
-    - Writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet using a fast XML patch.
-    - Preserves all other sheets, styles, and macros.
-    - If validation fails, it automatically falls back to a safe OpenPyXL rewrite (no Excel repair dialogs).
+    **Read acceleration**
+    - `.xlsb` uses **pyxlsb** for faster Excel binary reads.
+    - `.csv` uses **pyarrow.csv** (if installed) for very fast ingest.
+    - `.xlsx/.xlsm` continue to use **openpyxl** (reliable & widely supported).
 
-    **Integrity fixes included**
-    - Removes stale `mergeCells`, `dataValidations`, `conditionalFormatting`, hyperlinks, and `rowBreaks` intersecting the replaced area.
-    - Syncs Table ranges and `<tableColumns>`, and updates `autoFilter`.
-    - Updates workbook `_xlnm._FilterDatabase` defined name and **removes other local defined names** on Template that point into replaced rows.
-    - Drops `xl/calcChain.xml` (and its content-type override) so Excel rebuilds silently.
-    - Removes **orphan hyperlink relationships** from `sheetX.xml.rels`.
+    **Writer**
+    - Fast OOXML patch writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet.
+    - Preserves all other tabs, styles, macros, drawings, etc.
+    - Cleans stale merges/validations/CF/hyperlinks/page breaks and syncs tables to avoid Excel repair prompts.
+
+    **Tip**
+    - If your onboarding files are huge, convert to CSV and upload — with **pyarrow** this is the fastest path.
     """))
