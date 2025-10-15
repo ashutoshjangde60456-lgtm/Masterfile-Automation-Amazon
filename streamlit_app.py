@@ -15,7 +15,7 @@ from openpyxl import load_workbook
 # Page config
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation – OpenPyXL Value-Only (Fast)",
+    page_title="Masterfile Automation – OpenPyXL Delta Writer (Fast, Preserve All Sheets)",
     page_icon="🧾",
     layout="wide",
 )
@@ -94,54 +94,79 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
     return best[0], best[1], best_info
 
 # ─────────────────────────────────────────────────────────────────────
-# FAST OpenPyXL value-only writer (Template-only)
+# FAST OpenPyXL DELTA writer (Template-only, preserves workbook)
 # ─────────────────────────────────────────────────────────────────────
-def fast_openpyxl_value_only_writer(master_bytes: bytes,
-                                    sheet_name: str,
-                                    header_row: int,
-                                    start_row: int,
-                                    used_cols: int,
-                                    block_2d: list,
-                                    zip_fast: str = "stored") -> bytes:
+def fast_openpyxl_delta_writer(master_bytes: bytes,
+                               sheet_name: str,
+                               header_row: int,
+                               start_row: int,
+                               used_cols: int,
+                               block_2d: list,
+                               zip_fast: str = "stored") -> bytes:
     """
-    Faster (but safe) OpenPyXL Template-only writer.
-    - Value-only appends with tuple rows (no style writes)
-    - Single delete_rows call
-    - keep_vba=True preserves macros/other sheets
-    - Optional fast ZIP repack to reduce CPU time
-
-    zip_fast: "stored" (fastest, larger files) | "deflate1".."deflate9" | None (no repack)
+    OpenPyXL 'delta' writer: only touch cells that differ; append or trim minimally.
+    - Preserves full workbook (keep_vba=True)
+    - Values only (no style writes)
+    - Optional fast ZIP repack for save-time improvement
+    zip_fast: "stored" (fastest) | "deflate1".."deflate9" | None (skip repack)
     """
-    # 1) Load once, keep everything intact
     wb = load_workbook(io.BytesIO(master_bytes), keep_vba=True, data_only=False)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Sheet '{sheet_name}' not found.")
     ws = wb[sheet_name]
 
-    # 2) Clear previous data area in one go
-    maxr = ws.max_row or start_row
-    if maxr >= start_row:
-        ws.delete_rows(start_row, maxr - start_row + 1)
+    target_rows = len(block_2d)
+    end_row_new  = start_row + max(0, target_rows - 1)
+    end_row_prev = ws.max_row or (start_row - 1)
 
-    # 3) Append rows as tuples (slightly faster than lists)
-    for row in block_2d:
-        if used_cols < len(row):
+    # 1) Update overlap rows in place (no full deletes)
+    overlap = max(0, min(end_row_prev, end_row_new) - start_row + 1)
+    if overlap:
+        it = ws.iter_rows(min_row=start_row,
+                          max_row=start_row + overlap - 1,
+                          min_col=1,
+                          max_col=used_cols,
+                          values_only=True)
+        for i, old_row_vals in enumerate(it):
+            new_vals = block_2d[i]
+            # normalize to used_cols
+            if len(new_vals) < used_cols:
+                new_vals = new_vals + [""] * (used_cols - len(new_vals))
+            elif len(new_vals) > used_cols:
+                new_vals = new_vals[:used_cols]
+            row_idx = start_row + i
+            for j in range(used_cols):
+                old_v = old_row_vals[j] if old_row_vals and j < len(old_row_vals) else None
+                nv = new_vals[j]
+                nv_norm = None if nv == "" else nv
+                if old_v != nv_norm:
+                    ws.cell(row=row_idx, column=j+1).value = nv_norm
+
+    # 2) If there are extra new rows, append them
+    for i in range(overlap, target_rows):
+        row = block_2d[i]
+        if len(row) > used_cols:
             row = row[:used_cols]
-        # IMPORTANT: values only, no style/format changes
+        elif len(row) < used_cols:
+            row = row + [""] * (used_cols - len(row))
         ws.append(tuple(row))
 
-    # 4) Save to bytes
+    # 3) If there are surplus old rows, delete only the tail once
+    if end_row_prev > end_row_new:
+        ws.delete_rows(end_row_new + 1, end_row_prev - end_row_new)
+
+    # 4) Save
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     raw_bytes = out.getvalue()
 
-    # 5) Optional: re-pack ZIP for speed (skips heavy deflate)
+    # 5) Optional fast repack to reduce CPU at save time
     if zip_fast:
         zin = zipfile.ZipFile(io.BytesIO(raw_bytes), "r")
         mem = io.BytesIO()
         if zip_fast == "stored":
-            comp = zipfile.ZIP_STORED  # fastest, larger output
+            comp = zipfile.ZIP_STORED
             comp_args = {}
         else:
             comp = zipfile.ZIP_DEFLATED
@@ -149,8 +174,7 @@ def fast_openpyxl_value_only_writer(master_bytes: bytes,
             comp_args = {"compresslevel": max(1, min(9, level))}
         with zipfile.ZipFile(mem, "w", compression=comp, **comp_args) as zout:
             for info in zin.infolist():
-                data = zin.read(info.filename)
-                zout.writestr(info.filename, data)
+                zout.writestr(info.filename, zin.read(info.filename))
         zin.close()
         mem.seek(0)
         return mem.getvalue()
@@ -160,8 +184,8 @@ def fast_openpyxl_value_only_writer(master_bytes: bytes,
 # ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation – OpenPyXL Value-Only (Faster)")
-st.caption("Preserves the full workbook. Template-only rewrite with value-only fast path and fast ZIP repack.")
+st.title("🧾 Masterfile Automation – OpenPyXL Delta Writer (Faster)")
+st.caption("Preserves the full workbook. Updates only changed cells in the Template sheet for big speed-ups on repeated runs.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
@@ -202,7 +226,7 @@ if go:
                     aliases.append(k)
                 mapping_aliases[norm(k)] = aliases
 
-            # Read Template headers (read-only, fast)
+            # Read Template headers (read-only)
             status.update(label="Reading template headers…")
             masterfile_file.seek(0)
             master_bytes = masterfile_file.read()
@@ -285,17 +309,17 @@ if go:
                         if v and v.lower() not in ("nan", "none", ""):
                             block[i][col-1] = v
 
-            # 🐍 FAST OpenPyXL value-only writer
-            status.update(label="Writing (OpenPyXL value-only, fast)…")
+            # 🐍 FAST OpenPyXL DELTA writer (values only; preserves workbook)
+            status.update(label="Writing (OpenPyXL Delta Writer)…")
             t_write = time.time()
-            out_bytes = fast_openpyxl_value_only_writer(
+            out_bytes = fast_openpyxl_delta_writer(
                 master_bytes=master_bytes,
                 sheet_name=MASTER_TEMPLATE_SHEET,
                 header_row=MASTER_DISPLAY_ROW,
                 start_row=MASTER_DATA_START_ROW,
                 used_cols=used_cols,
                 block_2d=block,
-                zip_fast="stored"   # or "deflate1" for smaller files but still fast
+                zip_fast="stored"   # or "deflate1" for smaller output with still-fast compression
             )
             status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
             status.update(label="Finished", state="complete")
@@ -322,11 +346,12 @@ with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
     **What this does**
     - Preserves the entire workbook (all other sheets/macros/styles).
-    - Writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet with **value-only** fast appends.
-    - Uses a **fast ZIP repack** to reduce CPU time when saving.
+    - Writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet.
+    - Uses a **delta writer**: only cells that changed are updated, and only tail rows are added/trimmed.
+      This is dramatically faster on repeated runs with similar data.
 
     **Speed tips**
-    - Keep mapping/transformations in pandas (vectorized) before writing.
     - Install **lxml** (see requirements) for a C-accelerated XML backend in openpyxl.
-    - For even smaller files (with a bit more CPU), change `zip_fast="deflate1"`.
+    - Keep transformations in pandas before writing.
+    - For smaller files with still-fast save, use `zip_fast="deflate1"` in the writer call.
     """))
