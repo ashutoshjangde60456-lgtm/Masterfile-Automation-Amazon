@@ -8,13 +8,14 @@ from textwrap import dedent
 
 import pandas as pd
 import streamlit as st
+import requests
 from openpyxl import load_workbook
 
 # ─────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation – OpenPyXL Delta Stack (Fast & Safe)",
+    page_title="Masterfile Automation – ClosedXML Service (Fast) + OpenPyXL Fallback",
     page_icon="🧾",
     layout="wide",
 )
@@ -35,8 +36,11 @@ MASTER_DATA_START_ROW = 4            # first data row
 
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
 
+# ClosedXML service URL (set in Streamlit secrets or hardcode for local)
+CLOSEDXML_ENDPOINT = st.secrets.get("closedxml_url", "http://localhost:7071/api/patch-template")
+
 # ─────────────────────────────────────────────────────────────────────
-# Utilities
+# Helpers
 # ─────────────────────────────────────────────────────────────────────
 def sanitize(s):
     if s is None:
@@ -93,7 +97,7 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
     return best[0], best[1], best_info
 
 # ─────────────────────────────────────────────────────────────────────
-# OpenPyXL DELTA writer (values only) + fast ZIP repack
+# OpenPyXL DELTA fallback (values-only) + fast ZIP repack
 # ─────────────────────────────────────────────────────────────────────
 def fast_openpyxl_delta_writer(master_bytes: bytes,
                                sheet_name: str,
@@ -103,11 +107,8 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
                                block_2d: list,
                                zip_fast: str = "stored") -> bytes:
     """
-    OpenPyXL 'delta' writer: only touch cells that differ; append/trim minimally.
-    - Preserves full workbook (keep_vba=True)
-    - Values only (no style writes)
-    - Optional fast ZIP repack for save-time improvement
-    zip_fast: "stored" (fastest) | "deflate1".."deflate9" | None (skip repack)
+    Fallback only: OpenPyXL 'delta' writer – preserves workbook, values only.
+    zip_fast: "stored" (fastest) | "deflate1".."deflate9" | None
     """
     wb = load_workbook(io.BytesIO(master_bytes), keep_vba=True, data_only=False)
     if sheet_name not in wb.sheetnames:
@@ -118,7 +119,6 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
     end_row_new  = start_row + max(0, target_rows - 1)
     end_row_prev = ws.max_row or (start_row - 1)
 
-    # 1) Update overlap rows in place (no full deletes)
     overlap = max(0, min(end_row_prev, end_row_new) - start_row + 1)
     if overlap:
         it = ws.iter_rows(min_row=start_row,
@@ -128,7 +128,6 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
                           values_only=True)
         for i, old_row_vals in enumerate(it):
             new_vals = block_2d[i]
-            # normalize to used_cols
             if len(new_vals) < used_cols:
                 new_vals = new_vals + [""] * (used_cols - len(new_vals))
             elif len(new_vals) > used_cols:
@@ -141,7 +140,6 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
                 if old_v != nv_norm:
                     ws.cell(row=row_idx, column=j+1).value = nv_norm
 
-    # 2) If extra new rows → append them
     for i in range(overlap, target_rows):
         row = block_2d[i]
         if len(row) > used_cols:
@@ -150,17 +148,14 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
             row = row + [""] * (used_cols - len(row))
         ws.append(tuple(row))
 
-    # 3) If surplus old rows → delete tail once
     if end_row_prev > end_row_new:
         ws.delete_rows(end_row_new + 1, end_row_prev - end_row_new)
 
-    # 4) Save to bytes
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     raw_bytes = out.getvalue()
 
-    # 5) Optional fast repack to reduce CPU at save time
     if zip_fast:
         zin = zipfile.ZipFile(io.BytesIO(raw_bytes), "r")
         mem = io.BytesIO()
@@ -181,10 +176,56 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
     return raw_bytes
 
 # ─────────────────────────────────────────────────────────────────────
+# ClosedXML microservice writer (primary)
+# ─────────────────────────────────────────────────────────────────────
+def write_via_closedxml_service(master_bytes: bytes,
+                                sheet_name: str,
+                                header_row: int,
+                                start_row: int,
+                                used_cols: int,
+                                block_2d: list) -> bytes:
+    """
+    Call the ClosedXML microservice to patch the workbook fast & safely.
+    Expects multipart/form-data with:
+      - template: file bytes
+      - meta: JSON {sheet_name, header_row, start_row, used_cols}
+      - rows: NDJSON (each line is a JSON list for a row)
+    """
+    # Compose multipart: template + meta + ndjson rows
+    files = {
+        "template": (
+            "template.xlsx",
+            master_bytes,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        "meta": (
+            None,
+            json.dumps({
+                "sheet_name": sheet_name,
+                "header_row": header_row,
+                "start_row": start_row,
+                "used_cols": used_cols
+            }),
+            "application/json",
+        ),
+    }
+
+    # Stream rows as NDJSON for low memory overhead
+    ndjson = "\n".join(
+        json.dumps([(str(x) if x is not None else "") for x in row[:used_cols]])
+        for row in block_2d
+    )
+    files["rows"] = ("rows.ndjson", ndjson.encode("utf-8"), "application/x-ndjson")
+
+    resp = requests.post(CLOSEDXML_ENDPOINT, files=files, timeout=300)
+    resp.raise_for_status()
+    return resp.content
+
+# ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation — OpenPyXL Delta Stack (Fast & Cloud-Safe)")
-st.caption("Preserves the whole workbook. Only updates changed cells in the Template sheet. ZIP repack for faster saves.")
+st.title("🧾 Masterfile Automation — ClosedXML Service (Fast) + OpenPyXL Fallback")
+st.caption("Preserves the entire workbook. Writes Template sheet via a fast ClosedXML service. Falls back to OpenPyXL delta only if needed.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
@@ -241,12 +282,20 @@ if go:
             wb_ro.close()
             status.write(f"✅ Template headers loaded ({used_cols} columns) in {time.time()-t0:.2f}s")
 
-            # Read onboarding
+            # Read onboarding — pick best sheet based on mapping
             status.update(label="Reading onboarding…")
             onboarding_file.seek(0)
-            df = pd.read_excel(onboarding_file, engine="openpyxl", dtype=str).fillna("")
+            xl = pd.ExcelFile(onboarding_file, engine="openpyxl")
+            # Build normalized mapping lookup for pick
+            mapping_aliases_for_pick = {}
+            for k, v in mapping_raw.items():
+                aliases = v[:] if isinstance(v, list) else [v]
+                if k not in aliases: aliases.append(k)
+                mapping_aliases_for_pick[norm(k)] = aliases
+            best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases_for_pick)
+            df = best_df.fillna("")
             on_headers = list(df.columns)
-            status.write(f"✅ Onboarding loaded ({len(df)} rows)")
+            status.write(f"✅ Onboarding: **{best_sheet}** ({info}); rows={len(df)}")
 
             # Build mapping master -> source
             status.update(label="Resolving mapping…")
@@ -308,19 +357,33 @@ if go:
                         if v and v.lower() not in ("nan", "none", ""):
                             block[i][col-1] = v
 
-            # ✨ OpenPyXL Delta Writer (values only; preserves workbook)
-            status.update(label="Writing (OpenPyXL Delta Writer)…")
+            # ── Write via ClosedXML service (fast) with OpenPyXL fallback ──
+            status.update(label="Writing via ClosedXML service…")
             t_write = time.time()
-            out_bytes = fast_openpyxl_delta_writer(
-                master_bytes=master_bytes,
-                sheet_name=MASTER_TEMPLATE_SHEET,
-                header_row=MASTER_DISPLAY_ROW,
-                start_row=MASTER_DATA_START_ROW,
-                used_cols=used_cols,
-                block_2d=block,
-                zip_fast="stored"   # or "deflate1" for smaller files with still-fast compression
-            )
-            status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
+            try:
+                out_bytes = write_via_closedxml_service(
+                    master_bytes=master_bytes,
+                    sheet_name=MASTER_TEMPLATE_SHEET,
+                    header_row=MASTER_DISPLAY_ROW,
+                    start_row=MASTER_DATA_START_ROW,
+                    used_cols=used_cols,
+                    block_2d=block
+                )
+                status.write(f"✅ Service write completed in {time.time()-t_write:.2f}s")
+            except Exception as svc_err:
+                status.write(f"⚠️ Service unreachable, falling back to OpenPyXL delta. Error: {svc_err}")
+                t_write = time.time()
+                out_bytes = fast_openpyxl_delta_writer(
+                    master_bytes=master_bytes,
+                    sheet_name=MASTER_TEMPLATE_SHEET,
+                    header_row=MASTER_DISPLAY_ROW,
+                    start_row=MASTER_DATA_START_ROW,
+                    used_cols=used_cols,
+                    block_2d=block,
+                    zip_fast="stored"
+                )
+                status.write(f"✅ Fallback write completed in {time.time()-t_write:.2f}s")
+
             status.update(label="Finished", state="complete")
 
             # Download
@@ -343,11 +406,11 @@ if go:
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
-    **Delta Stack = fastest + safest with OpenPyXL**
-    - Preserves the entire workbook (all other sheets, macros, formatting).
-    - Writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet.
-    - Updates **only changed cells** and appends/trim tail rows → big speed-ups on repeated runs.
-    - Uses a **fast ZIP repack** to reduce CPU time on save.
-
-    **Tip**: install **lxml** (see requirements) for a C-accelerated XML backend used by openpyxl.
+    - Primary writer: **ClosedXML microservice** (compiled speed, preserves workbook, no repair pop-ups).
+    - Automatic fallback: **OpenPyXL Delta** (values-only, safe) if the service is unreachable.
+    - Keep your mapping & UI exactly the same; only the write step is swapped.
+    - Set `closedxml_url` in **.streamlit/secrets.toml**, e.g.
+      ```
+      closedxml_url = "https://YOUR-DEPLOYED-SERVICE/api/patch-template"
+      ```
     """))
