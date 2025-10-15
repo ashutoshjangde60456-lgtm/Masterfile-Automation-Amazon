@@ -188,21 +188,28 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
 
 def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
     root = ET.fromstring(table_xml_bytes)
+
+    # Update area (table ref + autofilter) to the new size
     new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
     af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
     if af is None:
         af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
     af.set("ref", new_ref)
+
+    # Keep the *actual* number of <tableColumn/> nodes.
+    # Do NOT force this to match last_col_n; Excel only requires ref to match the data area.
     tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
     if tcols is not None:
         child_count = sum(1 for _ in tcols)
-        new_count = max(child_count, last_col_n)
-        tcols.set("count", str(new_count))
+        tcols.set("count", str(child_count))
+
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
-def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
-    """Patch only 'sheet_name' data rows; keep all other parts untouched."""
+def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int,
+                        used_cols: int, block_2d: list) -> bytes:
+    """Patch only 'sheet_name' data rows; keep all other parts untouched.
+       Also removes calcChain so Excel won't show a repair dialog."""
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
     sheet_path = _find_sheet_part_path(zin, sheet_name)
     table_paths = _get_table_paths_for_sheet(zin, sheet_path)
@@ -233,16 +240,50 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, s
 
     out_bio = io.BytesIO()
     with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
+        # We'll conditionally drop calcChain.xml and its content-type override
+        content_types_bytes = None
+
         for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == sheet_path:
-                data = new_sheet_xml
-            elif item.filename in patched_tables:
-                data = patched_tables[item.filename]
-            zout.writestr(item, data)
+            name = item.filename
+            # 1) Write patched sheet XML
+            if name == sheet_path:
+                zout.writestr(item, new_sheet_xml)
+                continue
+            # 2) Write patched table XMLs
+            if name in patched_tables:
+                zout.writestr(item, patched_tables[name])
+                continue
+            # 3) Skip calcChain.xml (let Excel rebuild without "repair")
+            if name == "xl/calcChain.xml":
+                continue
+            # 4) Hold content types for later patch (so we can remove calcChain override)
+            if name == "[Content_Types].xml":
+                content_types_bytes = zin.read(name)
+                continue
+            # 5) Copy all other parts as-is
+            zout.writestr(item, zin.read(name))
+
+        # Patch [Content_Types].xml: remove calcChain override if present
+        if content_types_bytes is not None:
+            try:
+                ct_root = ET.fromstring(content_types_bytes)
+                ns_ct = "http://schemas.openxmlformats.org/package/2006/content-types"
+                ET.register_namespace("", ns_ct)
+                removed = False
+                for ov in list(ct_root.findall(f"{{{ns_ct}}}Override")):
+                    if ov.attrib.get("PartName", "").replace("\\", "/") == "/xl/calcChain.xml":
+                        ct_root.remove(ov)
+                        removed = True
+                ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True) if removed else content_types_bytes
+                zout.writestr("[Content_Types].xml", ct_bytes)
+            except Exception:
+                # If parsing fails, just write original
+                zout.writestr("[Content_Types].xml", content_types_bytes)
+
     zin.close()
     out_bio.seek(0)
     return out_bio.getvalue()
+
 
 # ─────────────────────────────────────────────────────────────────────
 # General helpers
