@@ -134,13 +134,36 @@ def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     u_last_row = max(orig_last_row, last_row)
     return f"A1:{_col_letter(u_last_col)}{u_last_row}"
 
-def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, used_cols_final: int, block_2d: list) -> bytes:
+def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int,
+                     used_cols_final: int, block_2d: list) -> bytes:
     root = ET.fromstring(sheet_xml_bytes)
-    sheetData = root.find(f"{{{XL_NS_MAIN}}}sheetData")
-    if sheetData is None:
-        sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
+    ns = XL_NS_MAIN
 
-    # Remove existing rows at/after start_row (leave headers)
+    def in_replaced_block(ref: str) -> bool:
+        # True if any cell in the ref touches rows >= start_row
+        # ref can be "A1" or "A1:C20 A25" (space-separated sqref)
+        def _any_row(rng: str) -> bool:
+            rng = rng.strip()
+            if not rng:
+                return False
+            parts = rng.split(":")
+            def _row(addr: str) -> int:
+                m = re.match(r"([A-Z]+)(\d+)$", addr)
+                return int(m.group(2)) if m else 10**9
+            if len(parts) == 1:
+                return _row(parts[0]) >= start_row
+            else:
+                r1, r2 = _row(parts[0]), _row(parts[1])
+                lo, hi = min(r1, r2), max(r1, r2)
+                return hi >= start_row
+        return any(_any_row(tok) for tok in ref.split())
+
+    # ---------------- sheetData: rewrite data rows ----------------
+    sheetData = root.find(f"{{{ns}}}sheetData")
+    if sheetData is None:
+        sheetData = ET.SubElement(root, f"{{{ns}}}sheetData")
+
+    # Drop existing rows at/after start_row (keep headers untouched)
     for row in list(sheetData):
         try:
             r = int(row.attrib.get("r", "0") or "0")
@@ -149,11 +172,11 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
         if r >= start_row:
             sheetData.remove(row)
 
-    # Append new rows with inline strings (sanitized)
+    # Append new rows as inline strings (fast, safe)
     row_span = f"1:{used_cols_final}" if used_cols_final > 0 else "1:1"
     for i, row_vals in enumerate(block_2d):
         r = start_row + i
-        row_el = ET.Element(f"{{{XL_NS_MAIN}}}row", r=str(r))
+        row_el = ET.Element(f"{{{ns}}}row", r=str(r))
         row_el.set("spans", row_span)
         row_el.set("{http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac}dyDescent", "0.25")
         any_val = False
@@ -162,47 +185,109 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
             if not v:
                 continue
             txt = sanitize_xml_text(v)
-            if txt == "":
+            if not txt:
                 continue
             any_val = True
             col = _col_letter(j+1)
-            c = ET.Element(f"{{{XL_NS_MAIN}}}c", r=f"{col}{r}", t="inlineStr")
-            is_el = ET.SubElement(c, f"{{{XL_NS_MAIN}}}is")
-            t_el = ET.SubElement(is_el, f"{{{XL_NS_MAIN}}}t")
+            c = ET.Element(f"{{{ns}}}c", r=f"{col}{r}", t="inlineStr")
+            is_el = ET.SubElement(c, f"{{{ns}}}is")
+            t_el = ET.SubElement(is_el, f"{{{ns}}}t")
             t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
             t_el.text = txt
             row_el.append(c)
         if any_val:
             sheetData.append(row_el)
 
-    # Dimension union (avoid repair prompts)
-    dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
+    # ---------------- dimension: union with original ----------------
+    dim = root.find(f"{{{ns}}}dimension")
     if dim is None:
-        dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension")
+        dim = ET.SubElement(root, f"{{{ns}}}dimension")
         dim.set("ref", "A1:A1")
     last_row = start_row + max(0, len(block_2d) - 1)
     new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row)
     dim.set("ref", new_ref)
 
+    # ---------------- remove stale structures that point into replaced block ----------------
+    # 1) mergeCells
+    mcs = root.find(f"{{{ns}}}mergeCells")
+    if mcs is not None:
+        for mc in list(mcs):
+            ref = mc.attrib.get("ref", "")
+            if in_replaced_block(ref):
+                mcs.remove(mc)
+        # keep correct count or remove the container if empty
+        count = len(list(mcs))
+        if count:
+            mcs.set("count", str(count))
+        else:
+            root.remove(mcs)
+
+    # 2) dataValidations
+    dvs = root.find(f"{{{ns}}}dataValidations")
+    if dvs is not None:
+        for dv in list(dvs):
+            ref = dv.attrib.get("sqref", "")
+            if in_replaced_block(ref):
+                dvs.remove(dv)
+        count = len(list(dvs))
+        if count:
+            dvs.set("count", str(count))
+        else:
+            root.remove(dvs)
+
+    # 3) conditionalFormatting (one element can carry multiple sqref tokens)
+    for cf in list(root.findall(f"{{{ns}}}conditionalFormatting")):
+        sqref = cf.attrib.get("sqref", "")
+        if not sqref:
+            continue
+        # keep only tokens safely above start_row
+        kept = " ".join(tok for tok in sqref.split() if not in_replaced_block(tok))
+        if kept:
+            cf.set("sqref", kept)
+        else:
+            root.remove(cf)
+
+    # 4) hyperlinks
+    hls = root.find(f"{{{ns}}}hyperlinks")
+    if hls is not None:
+        for hl in list(hls):
+            ref = hl.attrib.get("ref", "")
+            if in_replaced_block(ref):
+                hls.remove(hl)
+        if not list(hls):
+            root.remove(hls)
+
+    # 5) page breaks (rowBreaks)
+    rbr = root.find(f"{{{ns}}}rowBreaks")
+    if rbr is not None:
+        for brk in list(rbr):
+            try:
+                r = int(brk.attrib.get("id", "0"))
+            except Exception:
+                r = 0
+            if r >= start_row:
+                rbr.remove(brk)
+        if not list(rbr):
+            root.remove(rbr)
+
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
 
 def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
     root = ET.fromstring(table_xml_bytes)
+    ns = XL_NS_MAIN
 
-    # 1) Update table ref + autofilter range
     new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
-    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
+    af = root.find(f"{{{ns}}}autoFilter")
     if af is None:
-        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
+        af = ET.SubElement(root, f"{{{ns}}}autoFilter")
     af.set("ref", new_ref)
 
-    # 2) Ensure tableColumns COUNT AND CHILDREN match width
-    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+    tcols = root.find(f"{{{ns}}}tableColumns")
     if tcols is None:
-        tcols = ET.SubElement(root, f"{{{XL_NS_MAIN}}}tableColumns")
+        tcols = ET.SubElement(root, f"{{{ns}}}tableColumns")
 
-    # existing children + highest id
     existing = list(tcols)
     child_count = len(existing)
     max_id = 0
@@ -212,18 +297,16 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
         except Exception:
             pass
 
-    # append missing columns up to last_col_n
-    # (names are placeholders; Excel will update them from header cells)
+    # append missing <tableColumn/> so children == width
     for i in range(child_count + 1, last_col_n + 1):
         max_id += 1
-        tc = ET.SubElement(tcols, f"{{{XL_NS_MAIN}}}tableColumn")
+        tc = ET.SubElement(tcols, f"{{{ns}}}tableColumn")
         tc.set("id", str(max_id))
         tc.set("name", f"Column{i}")
 
-    # set count == number of children
     tcols.set("count", str(len(list(tcols))))
-
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
 
 
 def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int,
