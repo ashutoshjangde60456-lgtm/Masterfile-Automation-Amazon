@@ -1,25 +1,23 @@
-# app_masterfile.py
 import io
 import json
 import re
 import time
-import hashlib
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from textwrap import dedent
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 # ─────────────────────────────────────────────────────────────────────
 # App setup
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation – Preserve Others, Write Template Fast",
+    page_title="Masterfile Automation – Fast XML Writer (Template Only)",
     page_icon="🧾",
-    layout="wide"
+    layout="wide",
 )
 
 st.markdown("""
@@ -32,38 +30,226 @@ div.stButton>button,.stDownloadButton>button{background:#2563eb!important;color:
 # ─────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────
-MASTER_TEMPLATE_SHEET = "Template"  # the only sheet we write
-MASTER_DISPLAY_ROW    = 2           # headers row
-MASTER_SECONDARY_ROW  = 3           # subheaders row (e.g., bullet_point labels)
-MASTER_DATA_START_ROW = 4           # first data row
+MASTER_TEMPLATE_SHEET = "Template"   # write only here
+MASTER_DISPLAY_ROW    = 2            # main headers row in template
+MASTER_SECONDARY_ROW  = 3            # subheaders row (e.g. bullet_point labels)
+MASTER_DATA_START_ROW = 4            # first data row to write
 
 # ─────────────────────────────────────────────────────────────────────
-# Helpers (fast, cloud-safe; NO XML patching / NO COM / NO Node)
+# XML fast writer helpers (Linux-friendly, cloud-safe)
 # ─────────────────────────────────────────────────────────────────────
+XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+ET.register_namespace("", XL_NS_MAIN)
+ET.register_namespace("r", XL_NS_REL)
+ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
+ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
+
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
-def clean_vec(arr: np.ndarray) -> np.ndarray:
-    """Vectorized clean: remove invalid XML chars and trim common 'nan/none' strings."""
-    # Convert to str (vectorized) once
-    arr = arr.astype(object)
-    # Normalize None/NaN → ""
-    mask_none = pd.isna(arr)
-    if mask_none.any():
-        arr[mask_none] = ""
-    # Strip and drop 'nan'/'none'
-    def _norm_one(x):
-        s = str(x).strip()
-        if not s:
-            return ""
-        sl = s.lower()
-        if sl in ("nan", "none"):
-            return ""
-        # remove invalid xml chars
-        return _INVALID_XML_CHARS.sub("", s)
-    vfunc = np.vectorize(_norm_one, otypes=[object])
-    return vfunc(arr)
 
+def sanitize_xml_text(s) -> str:
+    if s is None:
+        return ""
+    return _INVALID_XML_CHARS.sub("", str(s))
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n-1, 26)
+        s = chr(65+r) + s
+    return s
+
+def _col_number(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        if not ch.isalpha(): break
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n
+
+def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
+    wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
+    rels_xml = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    rid = None
+    for sh in wb_xml.find(f"{{{XL_NS_MAIN}}}sheets"):
+        if sh.attrib.get("name") == sheet_name:
+            rid = sh.attrib.get(f"{{{XL_NS_REL}}}id")
+            break
+    if not rid:
+        raise ValueError(f"Sheet '{sheet_name}' not found.")
+    target = None
+    for rel in rels_xml:
+        if rel.attrib.get("Id") == rid:
+            target = rel.attrib.get("Target")
+            break
+    if not target:
+        raise ValueError(f"Relationship for sheet '{sheet_name}' not found.")
+    target = target.replace("\\", "/")
+    if target.startswith("../"): target = target[3:]
+    if not target.startswith("xl/"): target = "xl/" + target
+    return target  # e.g. xl/worksheets/sheet1.xml
+
+def _get_table_paths_for_sheet(z: zipfile.ZipFile, sheet_path: str) -> list:
+    rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/").replace(".xml", ".xml.rels")
+    if rels_path not in z.namelist():
+        return []
+    root = ET.fromstring(z.read(rels_path))
+    out = []
+    for rel in root:
+        t = rel.attrib.get("Type", "")
+        if t.endswith("/table"):
+            target = rel.attrib.get("Target", "").replace("\\", "/")
+            if target.startswith("../"): target = target[3:]
+            if not target.startswith("xl/"): target = "xl/" + target
+            out.append(target)
+    return out
+
+def _read_table_cols_count(table_xml_bytes: bytes) -> int:
+    try:
+        root = ET.fromstring(table_xml_bytes)
+        tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+        if tcols is None:
+            return 0
+        count_attr = tcols.attrib.get("count")
+        try:
+            count = int(count_attr) if count_attr is not None else 0
+        except Exception:
+            count = 0
+        child_count = sum(1 for _ in tcols)
+        return max(count, child_count)
+    except Exception:
+        return 0
+
+def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
+    try:
+        _, right = orig_dim_ref.split(":", 1)
+        m = re.match(r"([A-Z]+)(\d+)", right)
+        if m:
+            orig_last_col = _col_number(m.group(1))
+            orig_last_row = int(m.group(2))
+        else:
+            orig_last_col, orig_last_row = used_cols, last_row
+    except Exception:
+        orig_last_col, orig_last_row = used_cols, last_row
+    u_last_col = max(orig_last_col, used_cols)
+    u_last_row = max(orig_last_row, last_row)
+    return f"A1:{_col_letter(u_last_col)}{u_last_row}"
+
+def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, used_cols_final: int, block_2d: list) -> bytes:
+    root = ET.fromstring(sheet_xml_bytes)
+    sheetData = root.find(f"{{{XL_NS_MAIN}}}sheetData")
+    if sheetData is None:
+        sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
+
+    # Remove existing rows at/after start_row (leave headers)
+    for row in list(sheetData):
+        try:
+            r = int(row.attrib.get("r", "0") or "0")
+        except Exception:
+            r = 0
+        if r >= start_row:
+            sheetData.remove(row)
+
+    # Append new rows with inline strings (sanitized)
+    row_span = f"1:{used_cols_final}" if used_cols_final > 0 else "1:1"
+    for i, row_vals in enumerate(block_2d):
+        r = start_row + i
+        row_el = ET.Element(f"{{{XL_NS_MAIN}}}row", r=str(r))
+        row_el.set("spans", row_span)
+        row_el.set("{http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac}dyDescent", "0.25")
+        any_val = False
+        for j in range(used_cols_final):
+            v = row_vals[j] if j < len(row_vals) else ""
+            if not v:
+                continue
+            txt = sanitize_xml_text(v)
+            if txt == "":
+                continue
+            any_val = True
+            col = _col_letter(j+1)
+            c = ET.Element(f"{{{XL_NS_MAIN}}}c", r=f"{col}{r}", t="inlineStr")
+            is_el = ET.SubElement(c, f"{{{XL_NS_MAIN}}}is")
+            t_el = ET.SubElement(is_el, f"{{{XL_NS_MAIN}}}t")
+            t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            t_el.text = txt
+            row_el.append(c)
+        if any_val:
+            sheetData.append(row_el)
+
+    # Dimension union (avoid repair prompts)
+    dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
+    if dim is None:
+        dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension")
+        dim.set("ref", "A1:A1")
+    last_row = start_row + max(0, len(block_2d) - 1)
+    new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row)
+    dim.set("ref", new_ref)
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
+    root = ET.fromstring(table_xml_bytes)
+    new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
+    root.set("ref", new_ref)
+    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
+    if af is None:
+        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
+    af.set("ref", new_ref)
+    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+    if tcols is not None:
+        child_count = sum(1 for _ in tcols)
+        new_count = max(child_count, last_col_n)
+        tcols.set("count", str(new_count))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
+    """Patch only 'sheet_name' data rows; keep all other parts untouched."""
+    zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
+    sheet_path = _find_sheet_part_path(zin, sheet_name)
+    table_paths = _get_table_paths_for_sheet(zin, sheet_path)
+
+    # Respect widest table definition, if any
+    max_cols = used_cols
+    for tp in table_paths:
+        try:
+            cnt = _read_table_cols_count(zin.read(tp))
+            if cnt and cnt > max_cols:
+                max_cols = cnt
+        except Exception:
+            pass
+
+    original_sheet_xml = zin.read(sheet_path)
+    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
+
+    last_row = start_row + max(0, len(block_2d) - 1)
+    if last_row < header_row:
+        last_row = header_row
+
+    patched_tables = {}
+    for tp in table_paths:
+        try:
+            patched_tables[tp] = _patch_table_xml(zin.read(tp), header_row, last_row, max_cols)
+        except Exception:
+            pass
+
+    out_bio = io.BytesIO()
+    with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == sheet_path:
+                data = new_sheet_xml
+            elif item.filename in patched_tables:
+                data = patched_tables[item.filename]
+            zout.writestr(item, data)
+    zin.close()
+    out_bio.seek(0)
+    return out_bio.getvalue()
+
+# ─────────────────────────────────────────────────────────────────────
+# General helpers
+# ─────────────────────────────────────────────────────────────────────
 def norm(s: str) -> str:
-    if s is None: return ""
+    if s is None:
+        return ""
     x = str(s).strip().lower()
     x = x.replace("–","-").replace("—","-").replace("−","-")
     x = re.sub(r"[._/\\-]+"," ",x)
@@ -74,82 +260,9 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     if df.empty: return 0
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
-def worksheet_used_cols(ws, header_rows=(1,), hard_cap=4096, empty_streak_stop=8):
-    max_try = min(ws.max_column or 1, hard_cap)
-    last_nonempty, streak = 0, 0
-    for c in range(1, max_try + 1):
-        any_val = False
-        for r in header_rows:
-            v = ws.cell(row=r, column=c).value
-            if v not in (None, ""):
-                any_val = True; break
-        if any_val:
-            last_nonempty, streak = c, 0
-        else:
-            streak += 1
-            if streak >= empty_streak_stop: break
-    return max(last_nonempty, 1)
-
-def clear_data_region_fast(ws, start_row: int):
-    """Delete a trailing data region only if it exists (avoids expensive shifts)."""
-    max_row = ws.max_row or start_row
-    if max_row >= start_row:
-        ws.delete_rows(idx=start_row, amount=max_row - start_row + 1)
-
-def append_block_fast(ws, start_row: int, block_2d: np.ndarray):
-    """Append using openpyxl's append in a tight loop; pre-pad to start_row-1."""
-    cur_max = ws.max_row or 0
-    need = (start_row - 1) - cur_max
-    if need > 0:
-        ws.insert_rows(idx=cur_max + 1, amount=need)
-    # Append row-by-row (openpyxl's internal row builder is efficient when styles aren't touched)
-    for i in range(block_2d.shape[0]):
-        ws.append(block_2d[i, :].tolist())
-
-def update_tables_to_new_ref(ws, header_row: int, start_row: int, n_cols: int, n_rows: int):
-    if not getattr(ws, "tables", None):
-        return
-    last_row = max(header_row, start_row + max(0, n_rows - 1))
-    new_ref = f"A{header_row}:{get_column_letter(n_cols)}{last_row}"
-    for _, tbl in list(ws.tables.items()):
-        tbl.ref = new_ref
-
-def sha1_bytes(b: bytes) -> str:
-    h = hashlib.sha1(); h.update(b); return h.hexdigest()
-
-# ─────────────────────────────────────────────────────────────────────
-# CACHED OPERATIONS (major speed-ups on repeat runs)
-# ─────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def cached_parse_mapping(mapping_text: str, mapping_file_bytes: bytes | None):
-    if mapping_text.strip():
-        mapping_raw = json.loads(mapping_text)
-    else:
-        mapping_raw = json.loads(mapping_file_bytes.decode("utf-8"))
-    mapping_aliases = {}
-    for k, v in mapping_raw.items():
-        aliases = v[:] if isinstance(v, list) else [v]
-        if k not in aliases: aliases.append(k)
-        mapping_aliases[norm(k)] = aliases
-    return mapping_aliases
-
-@st.cache_data(show_spinner=False)
-def cached_template_headers(master_bytes: bytes, sheet_name: str):
-    wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
-    if sheet_name not in wb_ro.sheetnames:
-        wb_ro.close()
-        raise ValueError(f"Sheet '{sheet_name}' not found in template.")
-    ws_ro = wb_ro[sheet_name]
-    used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW))
-    display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
-    secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
-    wb_ro.close()
-    return used_cols, display_headers, secondary_headers
-
-@st.cache_data(show_spinner=False)
-def cached_pick_onboarding(onboarding_bytes: bytes, mapping_aliases_by_master: dict):
-    bio = io.BytesIO(onboarding_bytes)
-    xl = pd.ExcelFile(bio, engine="openpyxl")
+def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
+    uploaded_file.seek(0)
+    xl = pd.ExcelFile(uploaded_file, engine="openpyxl")
     best, best_score, best_info = None, -1, ""
     for sheet in xl.sheet_names:
         try:
@@ -167,15 +280,13 @@ def cached_pick_onboarding(onboarding_bytes: bytes, mapping_aliases_by_master: d
             best_info = f"matched headers: {matches}, non-empty rows: {rows}"
     if best is None:
         raise ValueError("No readable onboarding sheet found.")
-    df = best[0].fillna("")
-    df.columns = [str(c).strip() for c in df.columns]
-    return df, best[1], best_info
+    return best[0], best[1], best_info
 
 # ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation – Fast (Write Template only, keep other sheets)")
-st.caption("Cloud-safe: only updates the Template sheet; preserves all other tabs, styles, formulas, and macros.")
+st.title("🧾 Masterfile Automation – Fast (Template-only XML writer)")
+st.caption("Writes only the Template sheet; keeps all other tabs/styles/macros intact. Cloud-safe.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
@@ -191,43 +302,80 @@ with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
                                      placeholder='{\n  "Partner SKU": ["Seller SKU","item_sku"]\n}')
 with tab2:
-    mapping_json_upload = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
+    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 go = st.button("🚀 Generate Final Masterfile", type="primary")
-download_placeholder = st.empty()   # Download appears here after write completes
+download_placeholder = st.empty()
 
 # ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
 if go:
     if not masterfile_file or not onboarding_file:
-        st.error("Please upload both files.")
-        st.stop()
+        st.error("Please upload both files."); st.stop()
 
     with st.status("Starting…", expanded=True) as status:
         try:
-            # Read bytes once (for caching keys)
-            masterfile_file.seek(0); master_bytes = masterfile_file.read()
-            onboarding_file.seek(0); onboarding_bytes = onboarding_file.read()
-            map_bytes = mapping_json_upload.read() if mapping_json_upload is not None else None
-
-            # 1) Parse mapping (cached)
+            # Parse mapping
             status.update(label="Parsing mapping JSON…")
-            mapping_aliases = cached_parse_mapping(mapping_json_text, map_bytes)
-            status.write("✅ Mapping parsed & cached")
+            try:
+                mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
+            except Exception as e:
+                st.error(f"Mapping JSON parse error: {e}")
+                status.update(state="error"); st.stop()
 
-            # 2) Read template headers (cached by file hash)
+            mapping_aliases = {}
+            for k, v in mapping_raw.items():
+                aliases = v[:] if isinstance(v, list) else [v]
+                if k not in aliases: aliases.append(k)
+                mapping_aliases[norm(k)] = aliases
+
+            # Read template headers quickly (read-only)
             status.update(label="Reading Template headers…")
-            used_cols, display_headers, secondary_headers = cached_template_headers(master_bytes, MASTER_TEMPLATE_SHEET)
-            status.write(f"✅ Template headers loaded ({used_cols} columns)")
+            masterfile_file.seek(0)
+            master_bytes = masterfile_file.read()
+            t0 = time.time()
+            wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
+            if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
+                st.error(f"Sheet '{MASTER_TEMPLATE_SHEET}' not found in template.")
+                status.update(state="error"); st.stop()
+            ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
 
-            # 3) Pick onboarding sheet (cached)
+            # Detect used columns by scanning header rows
+            def worksheet_used_cols(ws, header_rows=(1,), hard_cap=4096, empty_streak_stop=8):
+                max_try = min(ws.max_column or 1, hard_cap)
+                last_nonempty, streak = 0, 0
+                for c in range(1, max_try + 1):
+                    any_val = False
+                    for r in header_rows:
+                        v = ws.cell(row=r, column=c).value
+                        if v not in (None, ""):
+                            any_val = True; break
+                    if any_val:
+                        last_nonempty, streak = c, 0
+                    else:
+                        streak += 1
+                        if streak >= empty_streak_stop: break
+                return max(last_nonempty, 1)
+
+            used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW))
+            display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
+            secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
+            wb_ro.close()
+            status.write(f"✅ Template headers loaded ({used_cols} columns) in {time.time()-t0:.2f}s")
+
+            # Pick best onboarding sheet
             status.update(label="Selecting best onboarding sheet…")
-            on_df, best_sheet, info = cached_pick_onboarding(onboarding_bytes, mapping_aliases)
+            try:
+                best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases)
+            except Exception as e:
+                st.error(f"Onboarding error: {e}")
+                status.update(state="error"); st.stop()
+            on_df = best_df.fillna("")
             on_headers = list(on_df.columns)
             status.write(f"✅ Using onboarding sheet: **{best_sheet}** ({info})")
 
-            # 4) Resolve mapping master->source (fast)
+            # Build mapping master -> source
             status.update(label="Resolving column mapping…")
             from difflib import SequenceMatcher
             def top_matches(query, candidates, k=3):
@@ -271,61 +419,38 @@ if go:
             status.write("**Mapping Summary**")
             for line in report_lines: status.write(line)
 
-            # 5) Build dense data block (NUMPY-ACCELERATED, by column)
+            # Build 2-D data block once (strings, sanitized only when needed)
             status.update(label="Building data block…")
             n_rows = len(on_df)
-            # Preallocate empty matrix
-            block = np.empty((n_rows, used_cols), dtype=object)
-            block[:] = ""
-
+            block = [[""] * used_cols for _ in range(n_rows)]
             for col, src in master_to_source.items():
                 if src is SENTINEL_LIST:
-                    block[:, col-1] = "List"
+                    for i in range(n_rows):
+                        block[i][col-1] = "List"
                 else:
-                    arr = src.to_numpy(dtype=object, copy=False)
-                    arr = clean_vec(arr)  # vectorized cleaning
-                    # Truncate or pad to n_rows
-                    if arr.shape[0] < n_rows:
-                        colvec = np.empty((n_rows,), dtype=object); colvec[:] = ""
-                        colvec[:arr.shape[0]] = arr
-                        block[:, col-1] = colvec
-                    else:
-                        block[:, col-1] = arr[:n_rows]
+                    vals = src.astype(str).tolist()
+                    m = min(len(vals), n_rows)
+                    for i in range(m):
+                        v = vals[i].strip()
+                        if v and v.lower() not in ("nan", "none", ""):
+                            block[i][col-1] = v
 
-            # 6) Write only Template sheet, keep others intact (openpyxl, optimized)
-            status.update(label="Writing Template sheet (preserving other sheets)…")
+            # ⚡ XML fast patch write (preserve other sheets/styles/macros)
+            status.update(label="Writing (XML fast patch)…")
             t_write = time.time()
-            ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
-            keep_vba = (ext == ".xlsm")
-
-            wb = load_workbook(io.BytesIO(master_bytes), keep_vba=keep_vba, data_only=False, keep_links=True)
-            ws = wb[MASTER_TEMPLATE_SHEET]
-
-            # Speed knob: Excel recalculates on open (single hit)
-            try:
-                wb.calculation_properties.fullCalcOnLoad = True
-            except Exception:
-                pass
-
-            # Clear old data once (skip if nothing to clear)
-            if (ws.max_row or 0) >= MASTER_DATA_START_ROW:
-                clear_data_region_fast(ws, start_row=MASTER_DATA_START_ROW)
-
-            # Append fast
-            append_block_fast(ws, start_row=MASTER_DATA_START_ROW, block_2d=block)
-
-            # Single table resize
-            update_tables_to_new_ref(ws, header_row=MASTER_DISPLAY_ROW,
-                                     start_row=MASTER_DATA_START_ROW,
-                                     n_cols=used_cols, n_rows=n_rows)
-
-            out_io = io.BytesIO()
-            wb.save(out_io)
-            out_io.seek(0)
+            out_bytes = fast_patch_template(
+                master_bytes=master_bytes,
+                sheet_name=MASTER_TEMPLATE_SHEET,
+                header_row=MASTER_DISPLAY_ROW,
+                start_row=MASTER_DATA_START_ROW,
+                used_cols=used_cols,
+                block_2d=block
+            )
             status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
-
-            # Finish + show download button BELOW the status panel
             status.update(label="Finished", state="complete")
+
+            # Download button appears below the status box
+            ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
             mime_map = {
                 ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
@@ -333,7 +458,7 @@ if go:
             out_mime = mime_map.get(ext, mime_map[".xlsx"])
             download_placeholder.download_button(
                 "⬇️ Download Final Masterfile",
-                data=out_io.getvalue(),
+                data=out_bytes,
                 file_name=f"final_masterfile{ext}",
                 mime=out_mime
             )
@@ -343,14 +468,11 @@ if go:
             st.exception(e)
 
 # ─────────────────────────────────────────────────────────────────────
-# Help
+# Notes
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
-    - **Only the `{MASTER_TEMPLATE_SHEET}` sheet is modified**; all other sheets/macros/formatting remain intact.
-    - Speed-ups added:
-        - Cached mapping + header detection + onboarding sheet selection.
-        - NumPy/pandas vectorized column fills (minimal Python loops).
-        - Skip row deletion if nothing to clear; otherwise single `delete_rows`.
-        - Single table resize and `fullCalcOnLoad=True` to defer calc to Excel.
+    - **Only the `{MASTER_TEMPLATE_SHEET}` sheet is modified** via an XML fast patch; all other sheets/macros/styles stay intact.
+    - Table ranges and autofilter on the Template sheet are auto-synchronized to the new data size.
+    - Invalid XML characters are removed to avoid Excel "repair" prompts.
     """))
