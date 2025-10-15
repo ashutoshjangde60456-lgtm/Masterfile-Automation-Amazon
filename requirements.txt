@@ -1,7 +1,4 @@
 streamlit>=1.36
 pandas>=2.2
 openpyxl>=3.1.2
-xlsxwriter>=3.2.0
-numpy>=1.26
-pyxlsb>=1.0.10
-pyarrow>=16.0.0  
+lxml>=4.9.4
