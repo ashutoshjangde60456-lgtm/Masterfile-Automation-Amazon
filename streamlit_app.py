@@ -1,4 +1,3 @@
-# streamlit_app.py
 import io
 import json
 import re
@@ -15,7 +14,7 @@ from openpyxl import load_workbook
 # Page config
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Masterfile Automation – OpenPyXL Delta Writer (Fast, Preserve All Sheets)",
+    page_title="Masterfile Automation – OpenPyXL Delta Stack (Fast & Safe)",
     page_icon="🧾",
     layout="wide",
 )
@@ -31,13 +30,13 @@ div.stButton>button,.stDownloadButton>button{background:#2563eb!important;color:
 # ─────────────────────────────────────────────────────────────────────
 MASTER_TEMPLATE_SHEET = "Template"   # write only here
 MASTER_DISPLAY_ROW    = 2            # header row
-MASTER_SECONDARY_ROW  = 3            # subheader row (e.g., bullet_point1..)
+MASTER_SECONDARY_ROW  = 3            # subheader row
 MASTER_DATA_START_ROW = 4            # first data row
 
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
 
 # ─────────────────────────────────────────────────────────────────────
-# Helpers
+# Utilities
 # ─────────────────────────────────────────────────────────────────────
 def sanitize(s):
     if s is None:
@@ -94,7 +93,7 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
     return best[0], best[1], best_info
 
 # ─────────────────────────────────────────────────────────────────────
-# FAST OpenPyXL DELTA writer (Template-only, preserves workbook)
+# OpenPyXL DELTA writer (values only) + fast ZIP repack
 # ─────────────────────────────────────────────────────────────────────
 def fast_openpyxl_delta_writer(master_bytes: bytes,
                                sheet_name: str,
@@ -104,7 +103,7 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
                                block_2d: list,
                                zip_fast: str = "stored") -> bytes:
     """
-    OpenPyXL 'delta' writer: only touch cells that differ; append or trim minimally.
+    OpenPyXL 'delta' writer: only touch cells that differ; append/trim minimally.
     - Preserves full workbook (keep_vba=True)
     - Values only (no style writes)
     - Optional fast ZIP repack for save-time improvement
@@ -142,7 +141,7 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
                 if old_v != nv_norm:
                     ws.cell(row=row_idx, column=j+1).value = nv_norm
 
-    # 2) If there are extra new rows, append them
+    # 2) If extra new rows → append them
     for i in range(overlap, target_rows):
         row = block_2d[i]
         if len(row) > used_cols:
@@ -151,11 +150,11 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
             row = row + [""] * (used_cols - len(row))
         ws.append(tuple(row))
 
-    # 3) If there are surplus old rows, delete only the tail once
+    # 3) If surplus old rows → delete tail once
     if end_row_prev > end_row_new:
         ws.delete_rows(end_row_new + 1, end_row_prev - end_row_new)
 
-    # 4) Save
+    # 4) Save to bytes
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -184,8 +183,8 @@ def fast_openpyxl_delta_writer(master_bytes: bytes,
 # ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
-st.title("🧾 Masterfile Automation – OpenPyXL Delta Writer (Faster)")
-st.caption("Preserves the full workbook. Updates only changed cells in the Template sheet for big speed-ups on repeated runs.")
+st.title("🧾 Masterfile Automation — OpenPyXL Delta Stack (Fast & Cloud-Safe)")
+st.caption("Preserves the whole workbook. Only updates changed cells in the Template sheet. ZIP repack for faster saves.")
 
 with st.container():
     c1, c2 = st.columns([1,1])
@@ -293,7 +292,7 @@ if go:
             for line in report_lines:
                 status.write(line)
 
-            # Build 2D block (string values)
+            # Build 2D block (strings only)
             status.update(label="Building data block…")
             n_rows = len(df)
             block = [[""] * used_cols for _ in range(n_rows)]
@@ -309,7 +308,7 @@ if go:
                         if v and v.lower() not in ("nan", "none", ""):
                             block[i][col-1] = v
 
-            # 🐍 FAST OpenPyXL DELTA writer (values only; preserves workbook)
+            # ✨ OpenPyXL Delta Writer (values only; preserves workbook)
             status.update(label="Writing (OpenPyXL Delta Writer)…")
             t_write = time.time()
             out_bytes = fast_openpyxl_delta_writer(
@@ -319,7 +318,7 @@ if go:
                 start_row=MASTER_DATA_START_ROW,
                 used_cols=used_cols,
                 block_2d=block,
-                zip_fast="stored"   # or "deflate1" for smaller output with still-fast compression
+                zip_fast="stored"   # or "deflate1" for smaller files with still-fast compression
             )
             status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
             status.update(label="Finished", state="complete")
@@ -344,14 +343,11 @@ if go:
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
-    **What this does**
-    - Preserves the entire workbook (all other sheets/macros/styles).
+    **Delta Stack = fastest + safest with OpenPyXL**
+    - Preserves the entire workbook (all other sheets, macros, formatting).
     - Writes **only** the `{MASTER_TEMPLATE_SHEET}` sheet.
-    - Uses a **delta writer**: only cells that changed are updated, and only tail rows are added/trimmed.
-      This is dramatically faster on repeated runs with similar data.
+    - Updates **only changed cells** and appends/trim tail rows → big speed-ups on repeated runs.
+    - Uses a **fast ZIP repack** to reduce CPU time on save.
 
-    **Speed tips**
-    - Install **lxml** (see requirements) for a C-accelerated XML backend in openpyxl.
-    - Keep transformations in pandas before writing.
-    - For smaller files with still-fast save, use `zip_fast="deflate1"` in the writer call.
+    **Tip**: install **lxml** (see requirements) for a C-accelerated XML backend used by openpyxl.
     """))
