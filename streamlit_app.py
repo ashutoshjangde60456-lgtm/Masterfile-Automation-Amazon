@@ -3,9 +3,11 @@ import io
 import json
 import re
 import time
+import hashlib
 from pathlib import Path
 from textwrap import dedent
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
@@ -14,7 +16,11 @@ from openpyxl.utils import get_column_letter
 # ─────────────────────────────────────────────────────────────────────
 # App setup
 # ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Masterfile Automation – Preserve Others, Write Template Fast", page_icon="🧾", layout="wide")
+st.set_page_config(
+    page_title="Masterfile Automation – Preserve Others, Write Template Fast",
+    page_icon="🧾",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
@@ -35,9 +41,26 @@ MASTER_DATA_START_ROW = 4           # first data row
 # Helpers (fast, cloud-safe; NO XML patching / NO COM / NO Node)
 # ─────────────────────────────────────────────────────────────────────
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
-def clean(s):
-    if s is None: return ""
-    return _INVALID_XML_CHARS.sub("", str(s))
+def clean_vec(arr: np.ndarray) -> np.ndarray:
+    """Vectorized clean: remove invalid XML chars and trim common 'nan/none' strings."""
+    # Convert to str (vectorized) once
+    arr = arr.astype(object)
+    # Normalize None/NaN → ""
+    mask_none = pd.isna(arr)
+    if mask_none.any():
+        arr[mask_none] = ""
+    # Strip and drop 'nan'/'none'
+    def _norm_one(x):
+        s = str(x).strip()
+        if not s:
+            return ""
+        sl = s.lower()
+        if sl in ("nan", "none"):
+            return ""
+        # remove invalid xml chars
+        return _INVALID_XML_CHARS.sub("", s)
+    vfunc = np.vectorize(_norm_one, otypes=[object])
+    return vfunc(arr)
 
 def norm(s: str) -> str:
     if s is None: return ""
@@ -67,9 +90,66 @@ def worksheet_used_cols(ws, header_rows=(1,), hard_cap=4096, empty_streak_stop=8
             if streak >= empty_streak_stop: break
     return max(last_nonempty, 1)
 
-def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
-    uploaded_file.seek(0)
-    xl = pd.ExcelFile(uploaded_file, engine="openpyxl")
+def clear_data_region_fast(ws, start_row: int):
+    """Delete a trailing data region only if it exists (avoids expensive shifts)."""
+    max_row = ws.max_row or start_row
+    if max_row >= start_row:
+        ws.delete_rows(idx=start_row, amount=max_row - start_row + 1)
+
+def append_block_fast(ws, start_row: int, block_2d: np.ndarray):
+    """Append using openpyxl's append in a tight loop; pre-pad to start_row-1."""
+    cur_max = ws.max_row or 0
+    need = (start_row - 1) - cur_max
+    if need > 0:
+        ws.insert_rows(idx=cur_max + 1, amount=need)
+    # Append row-by-row (openpyxl's internal row builder is efficient when styles aren't touched)
+    for i in range(block_2d.shape[0]):
+        ws.append(block_2d[i, :].tolist())
+
+def update_tables_to_new_ref(ws, header_row: int, start_row: int, n_cols: int, n_rows: int):
+    if not getattr(ws, "tables", None):
+        return
+    last_row = max(header_row, start_row + max(0, n_rows - 1))
+    new_ref = f"A{header_row}:{get_column_letter(n_cols)}{last_row}"
+    for _, tbl in list(ws.tables.items()):
+        tbl.ref = new_ref
+
+def sha1_bytes(b: bytes) -> str:
+    h = hashlib.sha1(); h.update(b); return h.hexdigest()
+
+# ─────────────────────────────────────────────────────────────────────
+# CACHED OPERATIONS (major speed-ups on repeat runs)
+# ─────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def cached_parse_mapping(mapping_text: str, mapping_file_bytes: bytes | None):
+    if mapping_text.strip():
+        mapping_raw = json.loads(mapping_text)
+    else:
+        mapping_raw = json.loads(mapping_file_bytes.decode("utf-8"))
+    mapping_aliases = {}
+    for k, v in mapping_raw.items():
+        aliases = v[:] if isinstance(v, list) else [v]
+        if k not in aliases: aliases.append(k)
+        mapping_aliases[norm(k)] = aliases
+    return mapping_aliases
+
+@st.cache_data(show_spinner=False)
+def cached_template_headers(master_bytes: bytes, sheet_name: str):
+    wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
+    if sheet_name not in wb_ro.sheetnames:
+        wb_ro.close()
+        raise ValueError(f"Sheet '{sheet_name}' not found in template.")
+    ws_ro = wb_ro[sheet_name]
+    used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW))
+    display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
+    secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
+    wb_ro.close()
+    return used_cols, display_headers, secondary_headers
+
+@st.cache_data(show_spinner=False)
+def cached_pick_onboarding(onboarding_bytes: bytes, mapping_aliases_by_master: dict):
+    bio = io.BytesIO(onboarding_bytes)
+    xl = pd.ExcelFile(bio, engine="openpyxl")
     best, best_score, best_info = None, -1, ""
     for sheet in xl.sheet_names:
         try:
@@ -87,29 +167,9 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
             best_info = f"matched headers: {matches}, non-empty rows: {rows}"
     if best is None:
         raise ValueError("No readable onboarding sheet found.")
-    return best[0], best[1], best_info
-
-def clear_data_region(ws, start_row: int):
-    max_row = ws.max_row or start_row
-    if max_row >= start_row:
-        ws.delete_rows(idx=start_row, amount=max_row - start_row + 1)
-
-def append_block(ws, start_row: int, block_2d):
-    # Ensure header rows exist; then append fast (values only)
-    cur_max = ws.max_row or 0
-    need = (start_row - 1) - cur_max
-    if need > 0:
-        ws.insert_rows(idx=cur_max + 1, amount=need)
-    for row in block_2d:
-        ws.append([clean(v) for v in row])
-
-def update_tables_to_new_ref(ws, header_row: int, start_row: int, n_cols: int, n_rows: int):
-    if not getattr(ws, "tables", None):
-        return
-    last_row = max(header_row, start_row + max(0, n_rows - 1))
-    new_ref = f"A{header_row}:{get_column_letter(n_cols)}{last_row}"
-    for _, tbl in list(ws.tables.items()):
-        tbl.ref = new_ref
+    df = best[0].fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, best[1], best_info
 
 # ─────────────────────────────────────────────────────────────────────
 # UI
@@ -131,70 +191,43 @@ with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
                                      placeholder='{\n  "Partner SKU": ["Seller SKU","item_sku"]\n}')
 with tab2:
-    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
+    mapping_json_upload = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 go = st.button("🚀 Generate Final Masterfile", type="primary")
+download_placeholder = st.empty()   # Download appears here after write completes
 
 # ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
-download_placeholder = st.empty()   # we’ll place the download button here after write finishes
-
 if go:
     if not masterfile_file or not onboarding_file:
         st.error("Please upload both files.")
         st.stop()
 
-    # Progress panel (Streamlit status keeps messages grouped under the button)
     with st.status("Starting…", expanded=True) as status:
         try:
-            # Step 1: parse mapping
+            # Read bytes once (for caching keys)
+            masterfile_file.seek(0); master_bytes = masterfile_file.read()
+            onboarding_file.seek(0); onboarding_bytes = onboarding_file.read()
+            map_bytes = mapping_json_upload.read() if mapping_json_upload is not None else None
+
+            # 1) Parse mapping (cached)
             status.update(label="Parsing mapping JSON…")
-            try:
-                mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
-            except Exception as e:
-                st.error(f"Mapping JSON parse error: {e}")
-                status.update(state="error")
-                st.stop()
+            mapping_aliases = cached_parse_mapping(mapping_json_text, map_bytes)
+            status.write("✅ Mapping parsed & cached")
 
-            mapping_aliases = {}
-            for k, v in mapping_raw.items():
-                aliases = v[:] if isinstance(v, list) else [v]
-                if k not in aliases: aliases.append(k)
-                mapping_aliases[norm(k)] = aliases
+            # 2) Read template headers (cached by file hash)
+            status.update(label="Reading Template headers…")
+            used_cols, display_headers, secondary_headers = cached_template_headers(master_bytes, MASTER_TEMPLATE_SHEET)
+            status.write(f"✅ Template headers loaded ({used_cols} columns)")
 
-            # Step 2: read template headers (read-only)
-            status.write("Reading Template headers…")
-            masterfile_file.seek(0)
-            master_bytes = masterfile_file.read()
-
-            t0 = time.time()
-            wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
-            if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
-                st.error(f"Sheet '{MASTER_TEMPLATE_SHEET}' not found in template.")
-                status.update(state="error"); st.stop()
-            ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
-            used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW))
-            display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
-            secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
-            wb_ro.close()
-            status.write(f"✅ Template headers loaded ({used_cols} columns) in {time.time()-t0:.2f}s")
-
-            # Step 3: pick onboarding sheet
+            # 3) Pick onboarding sheet (cached)
             status.update(label="Selecting best onboarding sheet…")
-            try:
-                onboarding_file.seek(0)
-                best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases)
-            except Exception as e:
-                st.error(f"Onboarding error: {e}")
-                status.update(state="error"); st.stop()
-
-            on_df = best_df.fillna("")
-            on_df.columns = [str(c).strip() for c in on_df.columns]
+            on_df, best_sheet, info = cached_pick_onboarding(onboarding_bytes, mapping_aliases)
             on_headers = list(on_df.columns)
             status.write(f"✅ Using onboarding sheet: **{best_sheet}** ({info})")
 
-            # Step 4: build mapping master->source
+            # 4) Resolve mapping master->source (fast)
             status.update(label="Resolving column mapping…")
             from difflib import SequenceMatcher
             def top_matches(query, candidates, k=3):
@@ -238,23 +271,28 @@ if go:
             status.write("**Mapping Summary**")
             for line in report_lines: status.write(line)
 
-            # Step 5: build dense data block (fast)
+            # 5) Build dense data block (NUMPY-ACCELERATED, by column)
             status.update(label="Building data block…")
             n_rows = len(on_df)
-            block = [[""] * used_cols for _ in range(n_rows)]
+            # Preallocate empty matrix
+            block = np.empty((n_rows, used_cols), dtype=object)
+            block[:] = ""
+
             for col, src in master_to_source.items():
                 if src is SENTINEL_LIST:
-                    for i in range(n_rows):
-                        block[i][col-1] = "List"
+                    block[:, col-1] = "List"
                 else:
-                    vals = src.astype(str).tolist()
-                    m = min(len(vals), n_rows)
-                    for i in range(m):
-                        v = clean(vals[i].strip())
-                        if v and v.lower() not in ("nan", "none", ""):
-                            block[i][col-1] = v
+                    arr = src.to_numpy(dtype=object, copy=False)
+                    arr = clean_vec(arr)  # vectorized cleaning
+                    # Truncate or pad to n_rows
+                    if arr.shape[0] < n_rows:
+                        colvec = np.empty((n_rows,), dtype=object); colvec[:] = ""
+                        colvec[:arr.shape[0]] = arr
+                        block[:, col-1] = colvec
+                    else:
+                        block[:, col-1] = arr[:n_rows]
 
-            # Step 6: write only Template sheet, keep others intact (fast openpyxl path)
+            # 6) Write only Template sheet, keep others intact (openpyxl, optimized)
             status.update(label="Writing Template sheet (preserving other sheets)…")
             t_write = time.time()
             ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
@@ -263,15 +301,22 @@ if go:
             wb = load_workbook(io.BytesIO(master_bytes), keep_vba=keep_vba, data_only=False, keep_links=True)
             ws = wb[MASTER_TEMPLATE_SHEET]
 
-            # Slight speed knobs: defer Excel calc, value-only appends
+            # Speed knob: Excel recalculates on open (single hit)
             try:
                 wb.calculation_properties.fullCalcOnLoad = True
             except Exception:
                 pass
 
-            clear_data_region(ws, start_row=MASTER_DATA_START_ROW)
-            append_block(ws, start_row=MASTER_DATA_START_ROW, block_2d=block)
-            update_tables_to_new_ref(ws, header_row=MASTER_DISPLAY_ROW, start_row=MASTER_DATA_START_ROW,
+            # Clear old data once (skip if nothing to clear)
+            if (ws.max_row or 0) >= MASTER_DATA_START_ROW:
+                clear_data_region_fast(ws, start_row=MASTER_DATA_START_ROW)
+
+            # Append fast
+            append_block_fast(ws, start_row=MASTER_DATA_START_ROW, block_2d=block)
+
+            # Single table resize
+            update_tables_to_new_ref(ws, header_row=MASTER_DISPLAY_ROW,
+                                     start_row=MASTER_DATA_START_ROW,
                                      n_cols=used_cols, n_rows=n_rows)
 
             out_io = io.BytesIO()
@@ -279,15 +324,13 @@ if go:
             out_io.seek(0)
             status.write(f"✅ Wrote & saved in {time.time()-t_write:.2f}s")
 
-            # Step 7: finish + show download button BELOW the status panel
+            # Finish + show download button BELOW the status panel
             status.update(label="Finished", state="complete")
-
             mime_map = {
                 ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
             }
             out_mime = mime_map.get(ext, mime_map[".xlsx"])
-
             download_placeholder.download_button(
                 "⬇️ Download Final Masterfile",
                 data=out_io.getvalue(),
@@ -305,6 +348,9 @@ if go:
 with st.expander("📘 Notes", expanded=False):
     st.markdown(dedent(f"""
     - **Only the `{MASTER_TEMPLATE_SHEET}` sheet is modified**; all other sheets/macros/formatting remain intact.
-    - Fast path: value-only bulk appends (no style writes), single table resize, and Excel recalculates on open.
-    - Works on Streamlit Cloud / Cloud Run / HF Spaces (pure Python).
+    - Speed-ups added:
+        - Cached mapping + header detection + onboarding sheet selection.
+        - NumPy/pandas vectorized column fills (minimal Python loops).
+        - Skip row deletion if nothing to clear; otherwise single `delete_rows`.
+        - Single table resize and `fullCalcOnLoad=True` to defer calc to Excel.
     """))
