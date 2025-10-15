@@ -274,8 +274,36 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
         new_count = max(child_count, last_col_n)
         tcols.set("count", str(new_count))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int,
-                        used_cols: int, block_2d: list) -> bytes:
+    
+    def _patch_sheet_rels(rels_xml_bytes, kept_hyperlink_ids):
+    """Remove hyperlink Relationships that are no longer referenced by the sheet."""
+    try:
+        ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+        ET.register_namespace("", ns_pkg)
+        root = ET.fromstring(rels_xml_bytes)
+        changed = False
+        for rel in list(root.findall(f"{{{ns_pkg}}}Relationship")):
+            rel_type = rel.attrib.get("Type", "")
+            rid = rel.attrib.get("Id")
+            # Only hyperlinks live here with this type; remove if not kept
+            if rel_type.endswith("/hyperlink") and rid and rid not in kept_hyperlink_ids:
+                root.remove(rel)
+                changed = True
+        if changed:
+            return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return rels_xml_bytes
+    except Exception:
+        # If parse fails, return original to avoid making things worse
+        return rels_xml_bytes
+        
+   def fast_patch_template(master_bytes, sheet_name, header_row, start_row, used_cols, block_2d):
+    """
+    Patch only 'sheet_name' data rows; keep all other parts untouched.
+    - Sync tables
+    - Update workbook defined name _xlnm._FilterDatabase for this sheet
+    - Drop calcChain (Excel rebuilds silently)
+    - Remove orphan hyperlink relationships in sheet rels
+    """
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
 
     # workbook + locate sheet index for defined names
@@ -285,7 +313,8 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
     local_id = None
     for idx, sh in enumerate(sheet_elems):
         if sh.attrib.get("name") == sheet_name:
-            local_id = idx; break
+            local_id = idx
+            break
     if local_id is None:
         raise ValueError(f"Sheet '{sheet_name}' not found in workbook.xml")
 
@@ -306,7 +335,9 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
 
     # patch sheet xml (and collect kept hyperlink r:ids)
     original_sheet_xml = zin.read(sheet_path)
-    new_sheet_xml, kept_hl_ids = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
+    new_sheet_xml, kept_hl_ids = _patch_sheet_xml(
+        original_sheet_xml, header_row, start_row, max_cols, block_2d
+    )
 
     # last row including data
     last_row = start_row + max(0, len(block_2d) - 1)
@@ -322,11 +353,12 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
             pass
 
     # patch workbook defined names (_xlnm._FilterDatabase for this sheet)
-    def patch_defined_names(wb_root: ET.Element):
+    def patch_defined_names(wb_root):
         ns_ct = XL_NS_MAIN
         dnames = wb_root.find(f"{{{ns_ct}}}definedNames")
-        if dnames is None: return wb_root
-        ref_abs = f"'{sheet_name}'!$A${header_row}:${_col_letter(max_cols)}${last_row}"
+        if dnames is None:
+            return wb_root
+        ref_abs = f"'{sheet_name}'!$A${header_row}:{_col_letter(max_cols)}${last_row}"
         for dn in list(dnames):
             if dn.attrib.get("name") == "_xlnm._FilterDatabase" and str(dn.attrib.get("localSheetId", "")) == str(local_id):
                 dn.text = ref_abs
@@ -344,24 +376,29 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
 
             # write patched parts
             if name == sheet_path:
-                zout.writestr(item, new_sheet_xml); continue
+                zout.writestr(item, new_sheet_xml)
+                continue
             if name in patched_tables:
-                zout.writestr(item, patched_tables[name]); continue
+                zout.writestr(item, patched_tables[name])
+                continue
             if name == "xl/workbook.xml":
-                zout.writestr(item, wb_xml_bytes); continue
+                zout.writestr(item, wb_xml_bytes)
+                continue
             # drop calcChain
             if name == "xl/calcChain.xml":
                 continue
             # hold [Content_Types].xml for patching calcChain override
             if name == "[Content_Types].xml":
-                content_types_bytes = zin.read(name); continue
+                content_types_bytes = zin.read(name)
+                continue
             # patch sheet rels to remove orphan hyperlink relationships
             if name == sheet_rels_path:
                 orig_rels = zin.read(name)
                 patched_rels = _patch_sheet_rels(orig_rels, kept_hl_ids)
-                zout.writestr(item, patched_rels); continue
+                zout.writestr(item, patched_rels)
+                continue
 
-            # copy all others
+            # copy all others byte-for-byte
             zout.writestr(item, zin.read(name))
 
         # patch [Content_Types].xml: remove calcChain override if present
@@ -373,16 +410,20 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
                 changed = False
                 for ov in list(ct_root.findall(f"{{{ns_pkg}}}Override")):
                     if ov.attrib.get("PartName", "").replace("\\", "/") == "/xl/calcChain.xml":
-                        ct_root.remove(ov); changed = True
-                ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True) if changed else content_types_bytes
+                        ct_root.remove(ov)
+                        changed = True
+                if changed:
+                    ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True)
+                else:
+                    ct_bytes = content_types_bytes
                 zout.writestr("[Content_Types].xml", ct_bytes)
             except Exception:
+                # If content types parsing fails, write original
                 zout.writestr("[Content_Types].xml", content_types_bytes)
 
     zin.close()
     out_bio.seek(0)
     return out_bio.getvalue()
-
 
 def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
     """Patch only 'sheet_name' data rows; keep all other parts untouched."""
