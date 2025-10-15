@@ -189,7 +189,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
 def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
     root = ET.fromstring(table_xml_bytes)
 
-    # Update area (table ref + autofilter) to the new size
+    # 1) Update table ref + autofilter range
     new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
     af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
@@ -197,24 +197,57 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
         af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
     af.set("ref", new_ref)
 
-    # Keep the *actual* number of <tableColumn/> nodes.
-    # Do NOT force this to match last_col_n; Excel only requires ref to match the data area.
+    # 2) Ensure tableColumns COUNT AND CHILDREN match width
     tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
-    if tcols is not None:
-        child_count = sum(1 for _ in tcols)
-        tcols.set("count", str(child_count))
+    if tcols is None:
+        tcols = ET.SubElement(root, f"{{{XL_NS_MAIN}}}tableColumns")
+
+    # existing children + highest id
+    existing = list(tcols)
+    child_count = len(existing)
+    max_id = 0
+    for tc in existing:
+        try:
+            max_id = max(max_id, int(tc.attrib.get("id", "0")))
+        except Exception:
+            pass
+
+    # append missing columns up to last_col_n
+    # (names are placeholders; Excel will update them from header cells)
+    for i in range(child_count + 1, last_col_n + 1):
+        max_id += 1
+        tc = ET.SubElement(tcols, f"{{{XL_NS_MAIN}}}tableColumn")
+        tc.set("id", str(max_id))
+        tc.set("name", f"Column{i}")
+
+    # set count == number of children
+    tcols.set("count", str(len(list(tcols))))
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
+
 def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int,
                         used_cols: int, block_2d: list) -> bytes:
-    """Patch only 'sheet_name' data rows; keep all other parts untouched.
-       Also removes calcChain so Excel won't show a repair dialog."""
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
+
+    # workbook + rels (we need this for sheet + definedName fixes)
+    wb_xml = ET.fromstring(zin.read("xl/workbook.xml"))
+    sheets_el = wb_xml.find(f"{{{XL_NS_MAIN}}}sheets")
+    sheet_elems = list(sheets_el) if sheets_el is not None else []
+    # localSheetId is the index of this sheet in <sheets>
+    local_id = None
+    for idx, sh in enumerate(sheet_elems):
+        if sh.attrib.get("name") == sheet_name:
+            local_id = idx
+            break
+    if local_id is None:
+        raise ValueError(f"Sheet '{sheet_name}' not found in workbook.xml")
+
+    # locate sheet part + tables
     sheet_path = _find_sheet_part_path(zin, sheet_name)
     table_paths = _get_table_paths_for_sheet(zin, sheet_path)
 
-    # Respect widest table definition, if any
+    # decide final width respecting table defs
     max_cols = used_cols
     for tp in table_paths:
         try:
@@ -224,13 +257,16 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, s
         except Exception:
             pass
 
+    # patch sheet xml
     original_sheet_xml = zin.read(sheet_path)
     new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
 
+    # last row incl data
     last_row = start_row + max(0, len(block_2d) - 1)
     if last_row < header_row:
         last_row = header_row
 
+    # patch tables (sync columns list + ranges)
     patched_tables = {}
     for tp in table_paths:
         try:
@@ -238,51 +274,73 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, s
         except Exception:
             pass
 
+    # also update workbook defined names: _xlnm._FilterDatabase for this sheet
+    def patch_defined_names(wb_root: ET.Element):
+        ns_ct = XL_NS_MAIN
+        dnames = wb_root.find(f"{{{ns_ct}}}definedNames")
+        if dnames is None:
+            return wb_root
+        ref_abs = f"'{sheet_name}'!$A${header_row}:${_col_letter(max_cols)}${last_row}"
+        changed = False
+        for dn in list(dnames):
+            if dn.attrib.get("name") == "_xlnm._FilterDatabase" and str(dn.attrib.get("localSheetId", "")) == str(local_id):
+                dn.text = ref_abs
+                # Must be hidden; Excel typically marks it like this
+                dn.set("hidden", "1")
+                changed = True
+        return wb_root
+
+    wb_xml_patched = patch_defined_names(wb_xml)
+    wb_xml_bytes = ET.tostring(wb_xml_patched, encoding="utf-8", xml_declaration=True)
+
     out_bio = io.BytesIO()
     with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
-        # We'll conditionally drop calcChain.xml and its content-type override
         content_types_bytes = None
 
         for item in zin.infolist():
             name = item.filename
-            # 1) Write patched sheet XML
+
+            # write patched parts
             if name == sheet_path:
                 zout.writestr(item, new_sheet_xml)
                 continue
-            # 2) Write patched table XMLs
             if name in patched_tables:
                 zout.writestr(item, patched_tables[name])
                 continue
-            # 3) Skip calcChain.xml (let Excel rebuild without "repair")
+            # drop calcChain (forces clean rebuild without "repair")
             if name == "xl/calcChain.xml":
                 continue
-            # 4) Hold content types for later patch (so we can remove calcChain override)
+            # hold content types to patch later
             if name == "[Content_Types].xml":
                 content_types_bytes = zin.read(name)
                 continue
-            # 5) Copy all other parts as-is
+            # replace workbook with our patched one
+            if name == "xl/workbook.xml":
+                zout.writestr(item, wb_xml_bytes)
+                continue
+
+            # copy everything else as-is
             zout.writestr(item, zin.read(name))
 
-        # Patch [Content_Types].xml: remove calcChain override if present
+        # patch [Content_Types].xml: remove calcChain override if present
         if content_types_bytes is not None:
             try:
+                ns_pkg = "http://schemas.openxmlformats.org/package/2006/content-types"
+                ET.register_namespace("", ns_pkg)
                 ct_root = ET.fromstring(content_types_bytes)
-                ns_ct = "http://schemas.openxmlformats.org/package/2006/content-types"
-                ET.register_namespace("", ns_ct)
-                removed = False
-                for ov in list(ct_root.findall(f"{{{ns_ct}}}Override")):
+                changed = False
+                for ov in list(ct_root.findall(f"{{{ns_pkg}}}Override")):
                     if ov.attrib.get("PartName", "").replace("\\", "/") == "/xl/calcChain.xml":
-                        ct_root.remove(ov)
-                        removed = True
-                ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True) if removed else content_types_bytes
+                        ct_root.remove(ov); changed = True
+                ct_bytes = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True) if changed else content_types_bytes
                 zout.writestr("[Content_Types].xml", ct_bytes)
             except Exception:
-                # If parsing fails, just write original
                 zout.writestr("[Content_Types].xml", content_types_bytes)
 
     zin.close()
     out_bio.seek(0)
     return out_bio.getvalue()
+
 
 
 # ─────────────────────────────────────────────────────────────────────
