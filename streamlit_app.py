@@ -164,11 +164,14 @@ def _ensure_ws_x14ac(root):
     # Allow x14ac attributes without repairs
     root.set("{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable", "x14ac")
 
-def _ensure_sheet_autofilter(root, new_ref: str):
-    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
-    if af is None:
-        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
-    af.set("ref", new_ref)
+def _intersects_range(a1: str, r1: int, r2: int) -> bool:
+    # a1 like "A3:B7" → True if overlap with [r1, r2]
+    m = re.match(r"^[A-Z]+(\d+):[A-Z]+(\d+)$", a1 or "", re.I)
+    if not m:
+        return False
+    lo = int(m.group(1)); hi = int(m.group(2))
+    if lo > hi: lo, hi = hi, lo
+    return not (hi < r1 or lo > r2)
 
 def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, used_cols_final: int, block_2d: list) -> bytes:
     root = ET.fromstring(sheet_xml_bytes)
@@ -178,45 +181,65 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
 
-    # Drop existing data rows >= start_row
+    # 1) Remove existing data rows at/after start_row
     for row in list(sheetData):
-        try: r = int(row.attrib.get("r") or "0")
-        except Exception: r = 0
+        try:
+            r = int(row.attrib.get("r") or "0")
+        except Exception:
+            r = 0
         if r >= start_row:
             sheetData.remove(row)
 
-    # Append fast inlineStr cells
+    # 2) Remove mergeCells that intersect our data region to prevent "Repaired Records"
+    mergeCells = root.find(f"{{{XL_NS_MAIN}}}mergeCells")
+    if mergeCells is not None:
+        for mc in list(mergeCells):
+            ref = mc.attrib.get("ref", "")
+            if _intersects_range(ref, start_row, 1048576):
+                mergeCells.remove(mc)
+        if len(list(mergeCells)) == 0:
+            root.remove(mergeCells)
+
+    # 3) Append dense rows (A..lastCol) using inlineStr (keeps rows visible, no sparse-row repair)
     row_span = f"1:{used_cols_final}" if used_cols_final > 0 else "1:1"
-    for i, row_vals in enumerate(block_2d):
+    n_rows = len(block_2d)
+    for i in range(n_rows):
         r = start_row + i
+        src_row = block_2d[i]
         row_el = ET.Element(f"{{{XL_NS_MAIN}}}row", r=str(r))
         row_el.set("spans", row_span)
         row_el.set("{http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac}dyDescent", "0.25")
-        any_val = False
+
         for j in range(used_cols_final):
-            v = row_vals[j] if j < len(row_vals) else ""
-            if not v: continue
-            txt = sanitize_xml_text(v)
-            if txt == "": continue
-            any_val = True
-            col = _col_letter(j+1)
+            val = src_row[j] if j < len(src_row) else ""
+            txt = sanitize_xml_text(val) if val else ""
+            col = _col_letter(j + 1)
             c = ET.Element(f"{{{XL_NS_MAIN}}}c", r=f"{col}{r}", t="inlineStr")
             is_el = ET.SubElement(c, f"{{{XL_NS_MAIN}}}is")
             t_el = ET.SubElement(is_el, f"{{{XL_NS_MAIN}}}t")
             t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            t_el.text = txt
+            t_el.text = txt  # empty allowed → row still visible
             row_el.append(c)
-        if any_val:
-            sheetData.append(row_el)
 
-    # Update dimension + sheet AutoFilter
+        sheetData.append(row_el)
+
+    # 4) Dimension: conservative union with original
     dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension", ref="A1:A1")
-    last_row = start_row + max(0, len(block_2d) - 1)
+    last_row = max(header_row, start_row + max(0, n_rows) - 1)
     new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row)
     dim.set("ref", new_ref)
-    _ensure_sheet_autofilter(root, f"A{header_row}:{_col_letter(used_cols_final)}{last_row}")
+
+    # 5) AutoFilter: only update if one existed originally
+    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
+    if af is not None:
+        af.set("ref", f"A{header_row}:{_col_letter(used_cols_final)}{last_row}")
+
+    # 6) Clear filterMode flag if present (prevents repair on changed rows)
+    sheetPr = root.find(f"{{{XL_NS_MAIN}}}sheetPr")
+    if sheetPr is not None and sheetPr.attrib.get("filterMode"):
+        sheetPr.attrib.pop("filterMode", None)
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -224,13 +247,17 @@ def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, las
     root = ET.fromstring(table_xml_bytes)
     new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
+
     af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
-    if af is None: af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
+    if af is None:
+        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
     af.set("ref", new_ref)
+
+    # Keep tableColumns list as-is; just ensure the 'count' equals the number of children (Excel requirement)
     tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
     if tcols is not None:
         child_count = sum(1 for _ in tcols)
-        tcols.set("count", str(max(child_count, last_col_n)))
+        tcols.set("count", str(child_count))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 def _strip_calcchain_override(ct_bytes: bytes) -> bytes:
@@ -251,7 +278,7 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, s
     sheet_path = _find_sheet_part_path(zin, sheet_name)
     table_paths = _get_table_paths_for_sheet(zin, sheet_path)
 
-    # widen to at least widest table (if any)
+    # Use at least the widest table width (some tables define more columns than headers)
     max_cols = used_cols
     for tp in table_paths:
         try:
@@ -379,29 +406,25 @@ if go:
 
     # Pick best onboarding sheet
     try:
-        uploaded = onboarding_file
-        best_xl = pd.ExcelFile(uploaded)
-        # build alias index once to score
-        def pick_best(mapping_aliases_by_master):
-            best, best_score, best_info = None, -1, ""
-            for sheet in best_xl.sheet_names:
-                try:
-                    df = best_xl.parse(sheet_name=sheet, header=0, dtype=str).fillna("")
-                    df.columns = [str(c).strip() for c in df.columns]
-                except Exception:
-                    continue
-                header_set = {norm(c) for c in df.columns}
-                matches = sum(any(norm(a) in header_set for a in aliases)
-                              for aliases in mapping_aliases_by_master.values())
-                rows = nonempty_rows(df)
-                score = matches + (0.01 if rows > 0 else 0.0)
-                if score > best_score:
-                    best, best_score = (df, sheet), score
-                    best_info = f"matched headers: {matches}, non-empty rows: {rows}"
-            if best is None:
-                raise ValueError("No readable onboarding sheet found.")
-            return best[0], best[1], best_info
-        best_df, best_sheet, info = pick_best(mapping_aliases)
+        best_xl = pd.ExcelFile(onboarding_file)
+        best, best_score, best_info = None, -1, ""
+        for sheet in best_xl.sheet_names:
+            try:
+                df = best_xl.parse(sheet_name=sheet, header=0, dtype=str).fillna("")
+                df.columns = [str(c).strip() for c in df.columns]
+            except Exception:
+                continue
+            header_set = {norm(c) for c in df.columns}
+            matches = sum(any(norm(a) in header_set for a in aliases)
+                          for aliases in mapping_aliases.values())
+            rows = nonempty_rows(df)
+            score = matches + (0.01 if rows > 0 else 0.0)
+            if score > best_score:
+                best, best_score = (df, sheet), score
+                best_info = f"matched headers: {matches}, non-empty rows: {rows}"
+        if best is None:
+            raise ValueError("No readable onboarding sheet found.")
+        best_df, best_sheet, info = best[0], best[1], best_info
     except Exception as e:
         st.error(f"Onboarding error: {e}"); st.stop()
 
@@ -445,7 +468,7 @@ if go:
 
     n_rows = len(on_df)
 
-    # Build sanitized 2-D block (very fast to write)
+    # Build sanitized 2-D block (dense writer will emit all columns)
     block = [[""] * used_cols for _ in range(n_rows)]
     for col, src in master_to_source.items():
         if src is SENTINEL_LIST:
