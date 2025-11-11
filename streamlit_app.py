@@ -98,6 +98,14 @@ def _col_number(letters: str) -> int:
         n = n * 26 + (ord(ch.upper()) - 64)
     return n
 
+# NEW: safe output filename (keeps letters, numbers, space, _ . -)
+def safe_filename(name: str, fallback: str = "final_masterfile") -> str:
+    if name is None:
+        return fallback
+    name = name.strip()
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "", name)
+    return name or fallback
+
 # ── ZIP / XML helpers ────────────────────────────────────────────────
 def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
@@ -328,6 +336,7 @@ st.markdown("<div class='section'><span class='badge badge-info'>Template-only w
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
+    # Accepts ANY filename; no naming restriction applied
     masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
 with c2:
     onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
@@ -340,6 +349,15 @@ with tab1:
                                      placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
+
+# NEW: custom output filename (without extension)
+st.markdown("#### 📝 Final file name")
+final_name_input = st.text_input(
+    "Type the name you want for the final masterfile (without extension)",
+    value="final_masterfile",
+    help="We'll add .xlsx or .xlsm automatically based on your template."
+)
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
@@ -361,7 +379,7 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
-    # extension & mime
+    # extension & mime (works with any uploaded name)
     ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
     mime_map = {
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -494,11 +512,14 @@ if go:
     )
     slog(f"✅ Done in {time.time()-t_write:.2f}s")
 
-    # Download
+    # Download — use the chosen base name + template extension
+    final_base = safe_filename(final_name_input, fallback="final_masterfile")
+    final_filename = f"{final_base}{ext}"
+
     st.download_button(
         "⬇️ Download Final Masterfile",
         data=out_bytes,
-        file_name=f"final_masterfile{ext}",
+        file_name=final_filename,
         mime=out_mime,
         key="dl_final_fast",
     )
@@ -513,5 +534,7 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     **Run**
     1) Upload the Masterfile (.xlsx/.xlsm) and the Onboarding (.xlsx)
     2) Paste/upload Mapping JSON
-    3) Click **Generate**
+    3) Choose your desired final file name
+    4) Click **Generate**
     """))
+
