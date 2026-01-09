@@ -337,10 +337,10 @@ st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
     # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
-    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"], accept_multiple_files=False)
+    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
 with c2:
     # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
-    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"], accept_multiple_files=False)
+    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
@@ -350,7 +350,7 @@ with tab1:
                                      placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
     # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
-    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file", accept_multiple_files=False)
+    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 # NEW: custom output filename (without extension)
 st.markdown("#### 📝 Final file name")
