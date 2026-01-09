@@ -74,15 +74,28 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
-    max_col = ws.max_column if ws.max_column is not None else hard_cap
-    max_try = min(max_col, hard_cap)
+    # In read_only mode, ws.max_column can be None → fall back to worksheet dimension.
+    max_col = ws.max_column
+    if not isinstance(max_col, int) or max_col <= 0:
+        try:
+            dim = ws.calculate_dimension()  # e.g. "A1:BF1200"
+            right = dim.split(":", 1)[-1]
+            m = re.match(r"([A-Z]+)\d+$", right, re.I)
+            max_col = _col_number(m.group(1)) if m else hard_cap
+        except Exception:
+            max_col = hard_cap
+
+    max_try = min(int(max_col), hard_cap)
+
     last_nonempty, streak = 0, 0
     for c in range(1, max_try + 1):
         any_val = any((ws.cell(row=r, column=c).value not in (None, "")) for r in header_rows)
-        if any_val: last_nonempty, streak = c, 0
+        if any_val:
+            last_nonempty, streak = c, 0
         else:
             streak += 1
-            if streak >= empty_streak_stop: break
+            if streak >= empty_streak_stop:
+                break
     return max(last_nonempty, 1)
 
 def _col_letter(n: int) -> str:
