@@ -336,10 +336,11 @@ st.markdown("<div class='section'><span class='badge badge-info'>Template-only w
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    # Accepts ANY filename; no naming restriction applied
-    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
+    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
+    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"], accept_multiple_files=False)
 with c2:
-    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
+    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
+    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"], accept_multiple_files=False)
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
@@ -348,7 +349,8 @@ with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
                                      placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
-    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
+    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
+    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file", accept_multiple_files=False)
 
 # NEW: custom output filename (without extension)
 st.markdown("#### 📝 Final file name")
@@ -537,4 +539,3 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     3) Choose your desired final file name
     4) Click **Generate**
     """))
-
