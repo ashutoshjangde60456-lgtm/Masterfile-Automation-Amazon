@@ -206,6 +206,11 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
             ref = mc.attrib.get("ref", "")
             if _intersects_range(ref, start_row, 1048576):
                 mergeCells.remove(mc)
+
+        # ✅ NEW: keep the count attribute correct (Excel repairs if count is wrong)
+        if "count" in mergeCells.attrib:
+            mergeCells.set("count", str(len(list(mergeCells))))
+
         if len(list(mergeCells)) == 0:
             root.remove(mergeCells)
 
