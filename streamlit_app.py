@@ -74,7 +74,7 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
-    max_try = min(ws.max_column or hard_cap, hard_cap)
+    max_try = min((ws.max_column or hard_cap), hard_cap)
 
     last_nonempty, streak = 0, 0
     for c in range(1, max_try + 1):
