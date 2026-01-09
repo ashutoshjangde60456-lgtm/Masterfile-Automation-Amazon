@@ -74,8 +74,7 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
-    max_try = min((ws.max_column or hard_cap), hard_cap)
-
+    max_try = min(ws.max_column, hard_cap)
     last_nonempty, streak = 0, 0
     for c in range(1, max_try + 1):
         any_val = any((ws.cell(row=r, column=c).value not in (None, "")) for r in header_rows)
@@ -206,11 +205,6 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
             ref = mc.attrib.get("ref", "")
             if _intersects_range(ref, start_row, 1048576):
                 mergeCells.remove(mc)
-
-        # ✅ NEW: keep the count attribute correct (Excel repairs if count is wrong)
-        if "count" in mergeCells.attrib:
-            mergeCells.set("count", str(len(list(mergeCells))))
-
         if len(list(mergeCells)) == 0:
             root.remove(mergeCells)
 
