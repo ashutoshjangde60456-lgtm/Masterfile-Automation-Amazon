@@ -74,28 +74,14 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
-    # In read_only mode, ws.max_column can be None → fall back to worksheet dimension.
-    max_col = ws.max_column
-    if not isinstance(max_col, int) or max_col <= 0:
-        try:
-            dim = ws.calculate_dimension()  # e.g. "A1:BF1200"
-            right = dim.split(":", 1)[-1]
-            m = re.match(r"([A-Z]+)\d+$", right, re.I)
-            max_col = _col_number(m.group(1)) if m else hard_cap
-        except Exception:
-            max_col = hard_cap
-
-    max_try = min(int(max_col), hard_cap)
-
+    max_try = min(ws.max_column if ws.max_column is not None else hard_cap, hard_cap)
     last_nonempty, streak = 0, 0
     for c in range(1, max_try + 1):
         any_val = any((ws.cell(row=r, column=c).value not in (None, "")) for r in header_rows)
-        if any_val:
-            last_nonempty, streak = c, 0
+        if any_val: last_nonempty, streak = c, 0
         else:
             streak += 1
-            if streak >= empty_streak_stop:
-                break
+            if streak >= empty_streak_stop: break
     return max(last_nonempty, 1)
 
 def _col_letter(n: int) -> str:
@@ -350,10 +336,9 @@ st.markdown("<div class='section'><span class='badge badge-info'>Template-only w
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
+    # Accepts ANY filename; no naming restriction applied
     masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
 with c2:
-    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
     onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
 
 st.markdown("#### 🔗 Mapping JSON")
@@ -363,7 +348,6 @@ with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
                                      placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
-    # Accepts ANY filename; no naming restriction applied - only file type (extension) is checked
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 # NEW: custom output filename (without extension)
