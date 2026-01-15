@@ -452,11 +452,15 @@ if go:
     on_headers = list(on_df.columns)
     st.success(f"Using onboarding sheet: **{best_sheet}** ({info})")
 
-    # Build mapping master col -> source series
+    # Build mapping master col -> source series with auto-matching
     series_by_alias = {norm(h): on_df[h] for h in on_headers}
     report_lines = ["#### 🔎 Mapping Summary (Template)"]
     BULLET_DISP_N = norm("Key Product Features")
     master_to_source = {}
+    
+    # Track which onboarding columns have been used (to avoid duplicate mappings)
+    used_onboarding_cols = set()
+    AUTO_MATCH_THRESHOLD = 0.70  # 70% similarity threshold for auto-matching
 
     for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
         disp_norm = norm(disp); sec_norm = norm(sec)
@@ -466,23 +470,51 @@ if go:
             effective_header = disp; label_for_log = disp
         eff_norm = norm(effective_header)
         if not eff_norm: continue
+        
+        # PHASE 1: Try explicit mapping from JSON
         aliases = mapping_aliases.get(eff_norm, [effective_header])
         resolved = None
+        matched_alias = None
         for a in aliases:
-            s = series_by_alias.get(norm(a))
-            if s is not None:
-                resolved = s; break
+            a_norm = norm(a)
+            if a_norm in series_by_alias and a_norm not in used_onboarding_cols:
+                resolved = series_by_alias[a_norm]
+                matched_alias = a
+                used_onboarding_cols.add(a_norm)
+                break
+        
         if resolved is not None:
             master_to_source[c] = resolved
-            report_lines.append(f"- ✅ **{label_for_log}** ← `{a}`")
+            report_lines.append(f"- ✅ **{label_for_log}** ← `{matched_alias}` (explicit)")
         else:
-            if disp_norm == norm("Listing Action (List or Unlist)"):
-                master_to_source[c] = SENTINEL_LIST
-                report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
+            # PHASE 2: Try auto-matching with fuzzy logic
+            candidates = [h for h in on_headers if norm(h) not in used_onboarding_cols]
+            if candidates:
+                best_matches = top_matches(effective_header, candidates, k=1)
+                if best_matches and best_matches[0][0] >= AUTO_MATCH_THRESHOLD:
+                    score, matched_col = best_matches[0]
+                    resolved = on_df[matched_col]
+                    master_to_source[c] = resolved
+                    used_onboarding_cols.add(norm(matched_col))
+                    report_lines.append(f"- 🔄 **{label_for_log}** ← `{matched_col}` (auto-matched {round(score*100,1)}%)")
+                else:
+                    # Special case: Listing Action
+                    if disp_norm == norm("Listing Action (List or Unlist)"):
+                        master_to_source[c] = SENTINEL_LIST
+                        report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
+                    else:
+                        # Show suggestions for unmapped columns
+                        sugg = top_matches(effective_header, on_headers, 3)
+                        sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
+                        report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
             else:
-                sugg = top_matches(effective_header, on_headers, 3)
-                sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
-                report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
+                # No candidates left
+                if disp_norm == norm("Listing Action (List or Unlist)"):
+                    master_to_source[c] = SENTINEL_LIST
+                    report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
+                else:
+                    report_lines.append(f"- ❌ **{label_for_log}** ← *no match found*")
+
     st.markdown("\n".join(report_lines))
 
     n_rows = len(on_df)
