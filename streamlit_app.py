@@ -107,28 +107,6 @@ def safe_filename(name: str, fallback: str = "final_masterfile") -> str:
     name = re.sub(r"[^A-Za-z0-9._ -]+", "", name)
     return name or fallback
 
-def get_columns_with_validation(wb, sheet_name: str, used_cols: int) -> set:
-    """Returns a set of column numbers that have data validation (dropdowns)."""
-    try:
-        ws = wb[sheet_name]
-        cols_with_validation = set()
-        
-        if hasattr(ws, 'data_validations') and ws.data_validations:
-            for dv in ws.data_validations.dataValidation:
-                # Parse the validation range (e.g., "A4:A1000" or "B:B")
-                if dv.sqref:
-                    for cell_range in str(dv.sqref).split():
-                        # Extract column from range like "CQ4:CQ1000" or "CQ:CQ"
-                        match = re.match(r"([A-Z]+)\d*:([A-Z]+)", cell_range)
-                        if match:
-                            col_letter = match.group(1)
-                            col_num = _col_number(col_letter)
-                            if 1 <= col_num <= used_cols:
-                                cols_with_validation.add(col_num)
-        return cols_with_validation
-    except Exception:
-        return set()
-
 # ── ZIP / XML helpers ────────────────────────────────────────────────
 def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
@@ -443,13 +421,7 @@ if go:
     display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
     secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
     wb_ro.close()
-    
-    # Read validation info (needs non-read-only mode)
-    wb_val = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False)
-    cols_with_dropdowns = get_columns_with_validation(wb_val, MASTER_TEMPLATE_SHEET, used_cols)
-    wb_val.close()
-    
-    slog(f"✅ Headers loaded (cols={used_cols}, {len(cols_with_dropdowns)} with dropdowns) in {time.time()-t0:.2f}s")
+    slog(f"✅ Headers loaded (cols={used_cols}) in {time.time()-t0:.2f}s")
 
     # Pick best onboarding sheet
     try:
@@ -480,15 +452,11 @@ if go:
     on_headers = list(on_df.columns)
     st.success(f"Using onboarding sheet: **{best_sheet}** ({info})")
 
-    # Build mapping master col -> source series with auto-matching
+    # Build mapping master col -> source series
     series_by_alias = {norm(h): on_df[h] for h in on_headers}
     report_lines = ["#### 🔎 Mapping Summary (Template)"]
     BULLET_DISP_N = norm("Key Product Features")
     master_to_source = {}
-    
-    # Track which onboarding columns have been used (to avoid duplicate mappings)
-    used_onboarding_cols = set()
-    AUTO_MATCH_THRESHOLD = 0.70  # 70% similarity threshold for auto-matching
 
     for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
         disp_norm = norm(disp); sec_norm = norm(sec)
@@ -498,59 +466,23 @@ if go:
             effective_header = disp; label_for_log = disp
         eff_norm = norm(effective_header)
         if not eff_norm: continue
-        
-        # PHASE 1: Try explicit mapping from JSON
         aliases = mapping_aliases.get(eff_norm, [effective_header])
         resolved = None
-        matched_alias = None
         for a in aliases:
-            a_norm = norm(a)
-            if a_norm in series_by_alias and a_norm not in used_onboarding_cols:
-                resolved = series_by_alias[a_norm]
-                matched_alias = a
-                used_onboarding_cols.add(a_norm)
-                break
-        
+            s = series_by_alias.get(norm(a))
+            if s is not None:
+                resolved = s; break
         if resolved is not None:
             master_to_source[c] = resolved
-            report_lines.append(f"- ✅ **{label_for_log}** ← `{matched_alias}` (explicit)")
+            report_lines.append(f"- ✅ **{label_for_log}** ← `{a}`")
         else:
-            # PHASE 2: Try auto-matching with fuzzy logic (skip dropdown columns)
-            candidates = [h for h in on_headers if norm(h) not in used_onboarding_cols]
-            
-            # Skip auto-matching for columns with dropdowns (data validation)
-            if c in cols_with_dropdowns:
-                if disp_norm == norm("Listing Action (List or Unlist)"):
-                    master_to_source[c] = SENTINEL_LIST
-                    report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
-                else:
-                    report_lines.append(f"- 🔒 **{label_for_log}** ← *skipped (dropdown column, needs explicit mapping)*")
-            elif candidates:
-                best_matches = top_matches(effective_header, candidates, k=1)
-                if best_matches and best_matches[0][0] >= AUTO_MATCH_THRESHOLD:
-                    score, matched_col = best_matches[0]
-                    resolved = on_df[matched_col]
-                    master_to_source[c] = resolved
-                    used_onboarding_cols.add(norm(matched_col))
-                    report_lines.append(f"- 🔄 **{label_for_log}** ← `{matched_col}` (auto-matched {round(score*100,1)}%)")
-                else:
-                    # Special case: Listing Action
-                    if disp_norm == norm("Listing Action (List or Unlist)"):
-                        master_to_source[c] = SENTINEL_LIST
-                        report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
-                    else:
-                        # Show suggestions for unmapped columns
-                        sugg = top_matches(effective_header, on_headers, 3)
-                        sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
-                        report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
+            if disp_norm == norm("Listing Action (List or Unlist)"):
+                master_to_source[c] = SENTINEL_LIST
+                report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
             else:
-                # No candidates left
-                if disp_norm == norm("Listing Action (List or Unlist)"):
-                    master_to_source[c] = SENTINEL_LIST
-                    report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
-                else:
-                    report_lines.append(f"- ❌ **{label_for_log}** ← *no match found*")
-
+                sugg = top_matches(effective_header, on_headers, 3)
+                sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
+                report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
     st.markdown("\n".join(report_lines))
 
     n_rows = len(on_df)
