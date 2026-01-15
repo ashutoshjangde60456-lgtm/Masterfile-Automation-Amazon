@@ -107,6 +107,28 @@ def safe_filename(name: str, fallback: str = "final_masterfile") -> str:
     name = re.sub(r"[^A-Za-z0-9._ -]+", "", name)
     return name or fallback
 
+def get_columns_with_validation(wb, sheet_name: str, used_cols: int) -> set:
+    """Returns a set of column numbers that have data validation (dropdowns)."""
+    try:
+        ws = wb[sheet_name]
+        cols_with_validation = set()
+        
+        if hasattr(ws, 'data_validations') and ws.data_validations:
+            for dv in ws.data_validations.dataValidation:
+                # Parse the validation range (e.g., "A4:A1000" or "B:B")
+                if dv.sqref:
+                    for cell_range in str(dv.sqref).split():
+                        # Extract column from range like "CQ4:CQ1000" or "CQ:CQ"
+                        match = re.match(r"([A-Z]+)\d*:([A-Z]+)", cell_range)
+                        if match:
+                            col_letter = match.group(1)
+                            col_num = _col_number(col_letter)
+                            if 1 <= col_num <= used_cols:
+                                cols_with_validation.add(col_num)
+        return cols_with_validation
+    except Exception:
+        return set()
+
 # ── ZIP / XML helpers ────────────────────────────────────────────────
 def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
@@ -421,7 +443,13 @@ if go:
     display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
     secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
     wb_ro.close()
-    slog(f"✅ Headers loaded (cols={used_cols}) in {time.time()-t0:.2f}s")
+    
+    # Read validation info (needs non-read-only mode)
+    wb_val = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False)
+    cols_with_dropdowns = get_columns_with_validation(wb_val, MASTER_TEMPLATE_SHEET, used_cols)
+    wb_val.close()
+    
+    slog(f"✅ Headers loaded (cols={used_cols}, {len(cols_with_dropdowns)} with dropdowns) in {time.time()-t0:.2f}s")
 
     # Pick best onboarding sheet
     try:
@@ -487,9 +515,17 @@ if go:
             master_to_source[c] = resolved
             report_lines.append(f"- ✅ **{label_for_log}** ← `{matched_alias}` (explicit)")
         else:
-            # PHASE 2: Try auto-matching with fuzzy logic
+            # PHASE 2: Try auto-matching with fuzzy logic (skip dropdown columns)
             candidates = [h for h in on_headers if norm(h) not in used_onboarding_cols]
-            if candidates:
+            
+            # Skip auto-matching for columns with dropdowns (data validation)
+            if c in cols_with_dropdowns:
+                if disp_norm == norm("Listing Action (List or Unlist)"):
+                    master_to_source[c] = SENTINEL_LIST
+                    report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
+                else:
+                    report_lines.append(f"- 🔒 **{label_for_log}** ← *skipped (dropdown column, needs explicit mapping)*")
+            elif candidates:
                 best_matches = top_matches(effective_header, candidates, k=1)
                 if best_matches and best_matches[0][0] >= AUTO_MATCH_THRESHOLD:
                     score, matched_col = best_matches[0]
