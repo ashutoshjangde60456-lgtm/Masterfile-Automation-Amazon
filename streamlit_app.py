@@ -537,5 +537,3 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     3) Choose your desired final file name
     4) Click **Generate**
     """))
-
-
